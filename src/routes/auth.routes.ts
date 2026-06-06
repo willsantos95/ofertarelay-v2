@@ -5,6 +5,7 @@ import crypto from 'crypto';
 import { pool } from '../config/database';
 import { gerarToken } from '../utils/tokens';
 import { limitadorRegistro, limitadorEntrada } from '../middleware/rateLimiter';
+import { autenticacaoRequerida, RequestComUsuario } from '../middleware/authRequired';
 import { logger } from '../utils/logger';
 
 const router = Router();
@@ -207,6 +208,29 @@ router.post('/entrar', limitadorEntrada, validacaoEntrada, async (req: Request, 
         codigoStatus: 500,
       },
     });
+  }
+});
+
+// GET /api/v1/auth/me
+router.get('/me', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
+  const usuarioId = req.usuario!.id;
+  try {
+    const resultado = await pool.query(
+      `SELECT id, nome, email, chave_api, status_plano, trial_termina_em
+       FROM users
+       WHERE id = $1 AND deletado_em IS NULL`,
+      [usuarioId]
+    );
+
+    if (resultado.rows.length === 0) {
+      res.status(404).json({ sucesso: false, erro: { codigo: 'USUARIO_NAO_ENCONTRADO', mensagem: 'Usuário não encontrado', codigoStatus: 404 } });
+      return;
+    }
+
+    res.json({ sucesso: true, usuario: resultado.rows[0] });
+  } catch (erro) {
+    logger.error({ erro }, 'Erro ao buscar usuário');
+    res.status(500).json({ sucesso: false, erro: { codigo: 'ERRO_INTERNO', mensagem: 'Erro interno', codigoStatus: 500 } });
   }
 });
 

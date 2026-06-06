@@ -5,6 +5,8 @@ import authRoutes from './routes/auth.routes';
 import billingRoutes from './routes/billing.routes';
 import whatsappRoutes from './routes/whatsapp.routes';
 import n8nRoutes from './routes/n8n.routes';
+import settingsRoutes from './routes/settings.routes';
+import relayRoutes from './routes/relay.routes';
 import { errorHandler } from './middleware/errorHandler';
 
 export function criarApp(): express.Application {
@@ -26,6 +28,8 @@ export function criarApp(): express.Application {
   app.use('/api/v1/faturamento', billingRoutes);
   app.use('/api/v1/whatsapp', whatsappRoutes);
   app.use('/api/v1/n8n', n8nRoutes);
+  app.use('/api/v1/settings', settingsRoutes);
+  app.use('/api/v1/relay', relayRoutes);
 
   app.use(errorHandler);
 

@@ -412,4 +412,65 @@ router.post(
   }
 );
 
+// GET /api/v1/whatsapp/dashboard
+router.get('/dashboard', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
+  const usuarioId = req.usuario!.id;
+  try {
+    const [instanciaResult, gruposResult] = await Promise.all([
+      pool.query(
+        `SELECT nome_instancia AS instance_name, telefone AS phone, status
+         FROM whatsapp_instances
+         WHERE usuario_id = $1 AND deletado_em IS NULL
+         ORDER BY criado_em DESC LIMIT 1`,
+        [usuarioId]
+      ),
+      pool.query(
+        `SELECT id, nome AS group_name, group_jid, nicho AS niche, papel AS role
+         FROM usuario_whatsapp_grupos
+         WHERE usuario_id = $1 AND deletado_em IS NULL
+         ORDER BY papel, nome`,
+        [usuarioId]
+      ),
+    ]);
+
+    const instance = instanciaResult.rows.length > 0 ? instanciaResult.rows[0] : null;
+    const todosGrupos = gruposResult.rows as { id: string; group_name: string; group_jid: string; niche: string; role: string }[];
+    const originGroups = todosGrupos.filter((g) => g.role === 'origem').map((g) => ({ ...g, status: 'active' }));
+    const destinationGroups = todosGrupos.filter((g) => g.role === 'destino').map((g) => ({ ...g, status: 'active' }));
+
+    res.json({
+      sucesso: true,
+      instance,
+      summary: {
+        total_groups: todosGrupos.length,
+        origin_groups: originGroups.length,
+        destination_groups: destinationGroups.length,
+      },
+      originGroups,
+      destinationGroups,
+    });
+  } catch (erro) {
+    logger.error({ erro }, 'Erro ao buscar dashboard WhatsApp');
+    res.status(500).json({ sucesso: false, erro: { codigo: 'ERRO_INTERNO', mensagem: 'Erro interno', codigoStatus: 500 } });
+  }
+});
+
+// GET /api/v1/whatsapp/grupos
+router.get('/grupos', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
+  const usuarioId = req.usuario!.id;
+  try {
+    const resultado = await pool.query(
+      `SELECT id, group_jid, nome, papel, nicho
+       FROM usuario_whatsapp_grupos
+       WHERE usuario_id = $1 AND deletado_em IS NULL
+       ORDER BY papel, nome`,
+      [usuarioId]
+    );
+    res.json({ sucesso: true, grupos: resultado.rows });
+  } catch (erro) {
+    logger.error({ erro }, 'Erro ao buscar grupos WhatsApp');
+    res.status(500).json({ sucesso: false, erro: { codigo: 'ERRO_INTERNO', mensagem: 'Erro interno', codigoStatus: 500 } });
+  }
+});
+
 export default router;
