@@ -304,6 +304,74 @@ router.post(
   }
 );
 
+// POST /api/v1/whatsapp/desconectar
+router.post('/desconectar', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
+  const usuarioId = req.usuario!.id;
+  try {
+    const instancia = await pool.query(
+      `SELECT * FROM whatsapp_instances WHERE usuario_id = $1 ORDER BY criado_em DESC LIMIT 1`,
+      [usuarioId]
+    );
+
+    if (instancia.rows.length === 0) {
+      res.status(404).json({ sucesso: false, erro: { codigo: 'INSTANCIA_NAO_ENCONTRADA', mensagem: 'Nenhuma instância encontrada', codigoStatus: 404 } });
+      return;
+    }
+
+    const nomeInstancia = instancia.rows[0].nome_instancia as string;
+
+    // Chamar Evolution para fazer logout
+    try {
+      await evolutionFetch(`/instance/logout/${nomeInstancia}`, { method: 'DELETE' });
+    } catch (err) {
+      logger.warn({ err: (err as Error).message }, 'Aviso ao desconectar Evolution (pode já estar desconectado)');
+    }
+
+    await pool.query(
+      `UPDATE whatsapp_instances SET status = 'desconectado', qrcode = NULL, atualizado_em = NOW() WHERE usuario_id = $1`,
+      [usuarioId]
+    );
+
+    res.json({ sucesso: true, mensagem: 'WhatsApp desconectado com sucesso.' });
+  } catch (erro: unknown) {
+    logger.error({ erro }, 'Erro ao desconectar WhatsApp');
+    res.status(500).json({ sucesso: false, erro: { codigo: 'ERRO_DESCONECTAR', mensagem: 'Erro ao desconectar', codigoStatus: 500 } });
+  }
+});
+
+// POST /api/v1/whatsapp/excluir
+router.post('/excluir', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
+  const usuarioId = req.usuario!.id;
+  try {
+    const instancia = await pool.query(
+      `SELECT * FROM whatsapp_instances WHERE usuario_id = $1 ORDER BY criado_em DESC LIMIT 1`,
+      [usuarioId]
+    );
+
+    if (instancia.rows.length > 0) {
+      const nomeInstancia = instancia.rows[0].nome_instancia as string;
+
+      // Excluir instância na Evolution
+      try {
+        await evolutionFetch(`/instance/delete/${nomeInstancia}`, { method: 'DELETE' });
+      } catch (err) {
+        logger.warn({ err: (err as Error).message }, 'Aviso ao excluir instância Evolution');
+      }
+    }
+
+    // Limpar todos os dados do WhatsApp do usuário
+    await pool.query(`DELETE FROM whatsapp_instances WHERE usuario_id = $1`, [usuarioId]);
+    await pool.query(`DELETE FROM whatsapp_group_cache WHERE usuario_id = $1`, [usuarioId]);
+    await pool.query(`DELETE FROM usuario_whatsapp_grupos WHERE usuario_id = $1`, [usuarioId]);
+    await pool.query(`DELETE FROM whatsapp_sync_jobs WHERE usuario_id = $1`, [usuarioId]);
+
+    res.json({ sucesso: true, mensagem: 'Dados do WhatsApp removidos com sucesso.' });
+  } catch (erro: unknown) {
+    logger.error({ erro }, 'Erro ao excluir dados WhatsApp');
+    res.status(500).json({ sucesso: false, erro: { codigo: 'ERRO_EXCLUIR', mensagem: 'Erro ao excluir dados', codigoStatus: 500 } });
+  }
+});
+
 // GET /api/v1/whatsapp/dashboard
 router.get('/dashboard', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
   const usuarioId = req.usuario!.id;
