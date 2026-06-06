@@ -128,15 +128,32 @@ router.post(
         // não fazer retry — logar o erro detalhado e deixar o frontend mostrar
       }
 
-      const resultado = await pool.query(
-        `INSERT INTO whatsapp_instances
-         (usuario_id, telefone, nome_instancia, status, qrcode, codigo_pareamento, expira_em)
-         VALUES ($1, $2, $3, $4, $5, $6, NOW() + INTERVAL '1 minute')
-         ON CONFLICT (usuario_id, telefone) DO UPDATE SET
-           status = $4, qrcode = $5, codigo_pareamento = $6, atualizado_em = NOW()
-         RETURNING *`,
-        [usuarioId, telefone, nomeInstancia, 'aguardando_conexao', qrcode, codigoPareamento]
+      // Verificar se já existe registro para upsert manual (evita ON CONFLICT com índice parcial)
+      const registroExistente = await pool.query(
+        `SELECT id FROM whatsapp_instances
+         WHERE usuario_id = $1 AND telefone = $2 AND deletado_em IS NULL`,
+        [usuarioId, telefone]
       );
+
+      let resultado;
+      if (registroExistente.rows.length > 0) {
+        resultado = await pool.query(
+          `UPDATE whatsapp_instances
+           SET status = $1, qrcode = $2, codigo_pareamento = $3,
+               nome_instancia = $4, expira_em = NOW() + INTERVAL '1 minute', atualizado_em = NOW()
+           WHERE usuario_id = $5 AND telefone = $6 AND deletado_em IS NULL
+           RETURNING *`,
+          ['aguardando_conexao', qrcode, codigoPareamento, nomeInstancia, usuarioId, telefone]
+        );
+      } else {
+        resultado = await pool.query(
+          `INSERT INTO whatsapp_instances
+           (usuario_id, telefone, nome_instancia, status, qrcode, codigo_pareamento, expira_em)
+           VALUES ($1, $2, $3, $4, $5, $6, NOW() + INTERVAL '1 minute')
+           RETURNING *`,
+          [usuarioId, telefone, nomeInstancia, 'aguardando_conexao', qrcode, codigoPareamento]
+        );
+      }
 
       const instancia = resultado.rows[0];
 
