@@ -3,16 +3,14 @@ type Response = ExpressResponse;
 import { body, query, validationResult } from 'express-validator';
 import Bull from 'bull';
 import { pool } from '../config/database';
+import { getRedisBullConfig } from '../config/redis';
 import { autenticacaoRequerida, RequestComUsuario } from '../middleware/authRequired';
 import { logger } from '../utils/logger';
 
 const router = Router();
 
 export const filaSync = new Bull('whatsapp-sync', {
-  redis: {
-    host: process.env.REDIS_HOST || 'localhost',
-    port: parseInt(process.env.REDIS_PORT || '6379'),
-  },
+  redis: getRedisBullConfig(),
 });
 
 const EVOLUTION_URL = process.env.EVOLUTION_API_URL || 'https://evolution-api.com';

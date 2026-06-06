@@ -3,7 +3,7 @@ import jwt from 'jsonwebtoken';
 import { criarApp } from '../server';
 
 jest.mock('../config/database', () => ({ pool: { query: jest.fn(), connect: jest.fn() } }));
-jest.mock('../config/redis', () => ({ redisClient: { connect: jest.fn(), sendCommand: jest.fn() } }));
+jest.mock('../config/redis', () => ({ redisClient: { connect: jest.fn(), sendCommand: jest.fn() }, getRedisBullConfig: jest.fn(() => ({ host: 'localhost', port: 6379 })) }));
 jest.mock('../middleware/rateLimiter', () => ({
   limitadorRegistro: (_: unknown, __: unknown, next: () => void) => next(),
   limitadorEntrada:  (_: unknown, __: unknown, next: () => void) => next(),

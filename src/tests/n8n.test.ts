@@ -10,7 +10,7 @@ jest.mock('../config/database', () => ({
 }));
 
 jest.mock('../config/redis', () => ({
-  redisClient: { connect: jest.fn(), sendCommand: jest.fn() },
+  redisClient: { connect: jest.fn(), sendCommand: jest.fn() }, getRedisBullConfig: jest.fn(() => ({ host: 'localhost', port: 6379 })),
 }));
 
 jest.mock('../middleware/rateLimiter', () => ({
