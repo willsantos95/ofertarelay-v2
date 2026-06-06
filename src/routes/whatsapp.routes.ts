@@ -1,6 +1,6 @@
 import { Router, Response as ExpressResponse } from 'express';
 type Response = ExpressResponse;
-import { body, query, validationResult } from 'express-validator';
+import { body, query as queryValidator, validationResult } from 'express-validator';
 import Bull from 'bull';
 import { pool } from '../config/database';
 import { getRedisBullConfig } from '../config/redis';
@@ -13,18 +13,63 @@ export const filaSync = new Bull('whatsapp-sync', {
   redis: getRedisBullConfig(),
 });
 
-const EVOLUTION_URL = process.env.EVOLUTION_API_URL || 'https://evolution-api.com';
+const EVOLUTION_URL = process.env.EVOLUTION_API_URL || '';
 const EVOLUTION_KEY = process.env.EVOLUTION_API_KEY || '';
 
-async function fetchEvolution(path: string, options: RequestInit = {}): Promise<globalThis.Response> {
-  return fetch(`${EVOLUTION_URL}${path}`, {
-    ...options,
-    headers: {
-      apikey: EVOLUTION_KEY,
-      'Content-Type': 'application/json',
-      ...(options.headers as Record<string, string> || {}),
-    },
-  });
+// Busca o QR em múltiplos campos possíveis (compatível com v1 e v2)
+function normalizeQrCode(data: Record<string, unknown>): string | null {
+  return (
+    (data?.qrcode as Record<string, unknown>)?.base64 as string ||
+    data?.qrcode as string ||
+    data?.base64 as string ||
+    data?.qr as string ||
+    data?.code as string ||
+    null
+  );
+}
+
+function normalizePairingCode(data: Record<string, unknown>): string | null {
+  return (
+    data?.pairingCode as string ||
+    data?.pairing_code as string ||
+    (data?.qrcode as Record<string, unknown>)?.pairingCode as string ||
+    null
+  );
+}
+
+async function evolutionFetch(path: string, options: RequestInit = {}, timeoutMs = 25000): Promise<Record<string, unknown>> {
+  if (!EVOLUTION_URL || !EVOLUTION_KEY) throw new Error('Evolution API não configurada');
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(`${EVOLUTION_URL}${path}`, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        apikey: EVOLUTION_KEY,
+        ...(options.headers as Record<string, string> || {}),
+      },
+    });
+
+    const text = await response.text();
+    let data: Record<string, unknown>;
+    try { data = text ? JSON.parse(text) as Record<string, unknown> : {}; }
+    catch { data = { raw: text }; }
+
+    if (!response.ok) {
+      throw new Error((data?.message || data?.error || `Erro Evolution: ${response.status}`) as string);
+    }
+
+    return data;
+  } catch (err: unknown) {
+    if ((err as Error).name === 'AbortError') throw new Error('Evolution API demorou demais. Tente novamente.');
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // POST /api/v1/whatsapp/conectar
@@ -39,144 +84,76 @@ router.post(
   async (req: RequestComUsuario, res: Response): Promise<void> => {
     const erros = validationResult(req);
     if (!erros.isEmpty()) {
-      res.status(400).json({
-        sucesso: false,
-        erro: {
-          codigo: 'VALIDACAO_TELEFONE',
-          mensagem: erros.array()[0].msg,
-          codigoStatus: 400,
-        },
-      });
+      res.status(400).json({ sucesso: false, erro: { codigo: 'VALIDACAO_TELEFONE', mensagem: erros.array()[0].msg, codigoStatus: 400 } });
       return;
     }
 
-    const { telefone } = req.body as { telefone: string };
     const usuarioId = req.usuario!.id;
+    const telefone = (req.body as { telefone: string }).telefone.replace(/\D/g, '');
+    const nomeInstancia = `minisaas_user_${usuarioId}_${telefone}`;
 
     try {
+      // 1. Verificar se já existe instância no banco
       const existente = await pool.query(
-        `SELECT * FROM whatsapp_instances
-         WHERE usuario_id = $1 AND telefone = $2 AND deletado_em IS NULL`,
+        `SELECT * FROM whatsapp_instances WHERE usuario_id = $1 AND telefone = $2 LIMIT 1`,
         [usuarioId, telefone]
       );
 
-      if (existente.rows.length > 0 && existente.rows[0].status === 'conectado') {
-        res.status(409).json({
-          sucesso: false,
-          erro: {
-            codigo: 'WHATSAPP_JA_CONECTADO',
-            mensagem: 'Este telefone já está conectado',
-            codigoStatus: 409,
-            instancia: {
-              nome: existente.rows[0].nome_instancia,
-              status: existente.rows[0].status,
-            },
-          },
-        });
-        return;
-      }
+      let instanciaId: string;
 
-      const nomeInstancia = `minisaas_user_${usuarioId}_${telefone}`;
-      let qrcode: string | null = null;
-      let codigoPareamento: string | null = null;
-
-      try {
-        // Tentar criar instância — se já existe (403/400), apenas buscar o QR
-        const respostaCreate = await fetchEvolution('/instance/create', {
-          method: 'POST',
-          body: JSON.stringify({
-            instanceName: nomeInstancia,
-            qrcode: true,
-            integration: 'WHATSAPP-BAILEYS',
-            number: telefone,
-          }),
-          signal: AbortSignal.timeout(15000),
-        });
-
-        type QRResp = { base64?: string; code?: string; pairingCode?: string; qrcode?: string };
-        type CreateResp = { qrcode?: QRResp; instance?: { instanceName?: string } };
-
-        let qrDados: QRResp | null = null;
-
-        if (respostaCreate.ok) {
-          const dadosCreate = await respostaCreate.json() as CreateResp;
-          // QR pode vir dentro de qrcode.base64 (v2) ou direto
-          if (dadosCreate.qrcode?.base64) {
-            qrDados = dadosCreate.qrcode;
-          }
-        }
-
-        // Se não veio QR no create (ou 403 = instância já existe), buscar via /connect
-        if (!qrDados) {
-          const respostaQR = await fetchEvolution(`/instance/connect/${nomeInstancia}`, {
-            signal: AbortSignal.timeout(8000),
+      if (existente.rows.length === 0) {
+        // 2a. Criar instância na Evolution (ignorar erro se já existe)
+        try {
+          await evolutionFetch('/instance/create', {
+            method: 'POST',
+            body: JSON.stringify({ instanceName: nomeInstancia, qrcode: true, integration: 'WHATSAPP-BAILEYS' }),
           });
-          if (respostaQR.ok) {
-            qrDados = await respostaQR.json() as QRResp;
-          }
+        } catch (err) {
+          // Se deu erro mas não é "já existe", logar mas continuar
+          logger.warn({ err: (err as Error).message }, 'Aviso ao criar instância Evolution (pode já existir)');
         }
 
-        if (qrDados) {
-          const qrRaw = qrDados.base64 || qrDados.qrcode || null;
-          qrcode = qrRaw
-            ? (qrRaw.startsWith('data:') ? qrRaw : `data:image/png;base64,${qrRaw}`)
-            : null;
-          codigoPareamento = qrDados.pairingCode || qrDados.code || null;
-        }
-      } catch (err) {
-        logger.warn({ err, telefone, msg: (err as Error).message }, 'Erro Evolution — sem QR code');
-        // não fazer retry — logar o erro detalhado e deixar o frontend mostrar
-      }
-
-      // Verificar se já existe registro para upsert manual (evita ON CONFLICT com índice parcial)
-      const registroExistente = await pool.query(
-        `SELECT id FROM whatsapp_instances
-         WHERE usuario_id = $1 AND telefone = $2 AND deletado_em IS NULL`,
-        [usuarioId, telefone]
-      );
-
-      let resultado;
-      if (registroExistente.rows.length > 0) {
-        resultado = await pool.query(
-          `UPDATE whatsapp_instances
-           SET status = $1, qrcode = $2, codigo_pareamento = $3,
-               nome_instancia = $4, expira_em = NOW() + INTERVAL '1 minute', atualizado_em = NOW()
-           WHERE usuario_id = $5 AND telefone = $6 AND deletado_em IS NULL
-           RETURNING *`,
-          ['aguardando_conexao', qrcode, codigoPareamento, nomeInstancia, usuarioId, telefone]
+        // 2b. Inserir no banco
+        const inserido = await pool.query(
+          `INSERT INTO whatsapp_instances (usuario_id, telefone, nome_instancia, status)
+           VALUES ($1, $2, $3, 'aguardando_conexao') RETURNING id`,
+          [usuarioId, telefone, nomeInstancia]
         );
+        instanciaId = inserido.rows[0].id as string;
       } else {
-        resultado = await pool.query(
-          `INSERT INTO whatsapp_instances
-           (usuario_id, telefone, nome_instancia, status, qrcode, codigo_pareamento, expira_em)
-           VALUES ($1, $2, $3, $4, $5, $6, NOW() + INTERVAL '1 minute')
-           RETURNING *`,
-          [usuarioId, telefone, nomeInstancia, 'aguardando_conexao', qrcode, codigoPareamento]
-        );
+        instanciaId = existente.rows[0].id as string;
       }
 
-      const instancia = resultado.rows[0];
+      // 3. Buscar QR code via /instance/connect
+      const connectData = await evolutionFetch(`/instance/connect/${nomeInstancia}`, { method: 'GET' });
+
+      const qrcode = normalizeQrCode(connectData);
+      const pairingCode = normalizePairingCode(connectData);
+
+      // 4. Atualizar banco com QR
+      await pool.query(
+        `UPDATE whatsapp_instances
+         SET qrcode = $1, codigo_pareamento = $2, status = 'aguardando_conexao',
+             expira_em = NOW() + INTERVAL '1 minute', atualizado_em = NOW()
+         WHERE id = $3`,
+        [qrcode, pairingCode, instanciaId]
+      );
 
       res.status(201).json({
         sucesso: true,
         instancia: {
-          nome: instancia.nome_instancia,
-          telefone: instancia.telefone,
-          status: instancia.status,
-          qrcode: instancia.qrcode,
-          codigoPareamento: instancia.codigo_pareamento,
-          expiracao: instancia.expira_em,
+          nome: nomeInstancia,
+          telefone,
+          status: 'aguardando_conexao',
+          qrcode,
+          codigoPareamento: pairingCode,
         },
       });
     } catch (erro: unknown) {
       logger.error({ erro, usuarioId, telefone }, 'Erro ao conectar WhatsApp');
       res.status(500).json({
         sucesso: false,
-        erro: {
-          codigo: 'ERRO_CONEXAO_EVOLUTION',
-          mensagem: 'Erro ao conectar com Evolution API',
-          codigoStatus: 500,
-        },
+        erro: { codigo: 'ERRO_CONEXAO_EVOLUTION', mensagem: (erro as Error).message || 'Erro ao conectar', codigoStatus: 500 },
       });
     }
   }
@@ -185,35 +162,24 @@ router.post(
 // GET /api/v1/whatsapp/status
 router.get('/status', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
   const usuarioId = req.usuario!.id;
-
   try {
-    const resultadoDb = await pool.query(
-      `SELECT * FROM whatsapp_instances
-       WHERE usuario_id = $1 AND deletado_em IS NULL
-       ORDER BY criado_em DESC LIMIT 1`,
+    const resultado = await pool.query(
+      `SELECT * FROM whatsapp_instances WHERE usuario_id = $1 ORDER BY criado_em DESC LIMIT 1`,
       [usuarioId]
     );
 
-    if (resultadoDb.rows.length === 0) {
+    if (resultado.rows.length === 0) {
       res.json({ sucesso: true, conectado: false, status: 'nao_criado' });
       return;
     }
 
-    const instancia = resultadoDb.rows[0];
-    let statusAtual: string = instancia.status;
+    const instancia = resultado.rows[0];
+    let statusAtual = instancia.status as string;
 
     try {
-      const respostaEvolution = await fetchEvolution(
-        `/instance/connectionState/${instancia.nome_instancia}`,
-        { signal: AbortSignal.timeout(5000) }
-      );
-      if (respostaEvolution.ok) {
-        const dados = await respostaEvolution.json() as {
-          instance?: { state?: string };
-        };
-        const state = dados.instance?.state || 'desconhecido';
-        statusAtual = state === 'open' || state === 'connected' ? 'conectado' : state;
-      }
+      const stateData = await evolutionFetch(`/instance/connectionState/${instancia.nome_instancia}`, { method: 'GET' }, 12000);
+      const state = (stateData?.instance as Record<string, unknown>)?.state as string || stateData?.state as string || stateData?.connectionStatus as string || statusAtual;
+      statusAtual = (state === 'open' || state === 'connected') ? 'conectado' : state;
     } catch {
       logger.warn({ instancia: instancia.nome_instancia }, 'Erro ao checar status Evolution, usando DB');
     }
@@ -227,84 +193,43 @@ router.get('/status', autenticacaoRequerida, async (req: RequestComUsuario, res:
       sucesso: true,
       conectado: statusAtual === 'conectado',
       status: statusAtual,
-      instancia: {
-        nome: instancia.nome_instancia,
-        telefone: instancia.telefone,
-        conectadoEm: instancia.conectado_em,
-      },
+      instancia: { nome: instancia.nome_instancia, telefone: instancia.telefone, conectadoEm: instancia.conectado_em },
     });
   } catch (erro: unknown) {
     logger.error({ erro }, 'Erro ao verificar status');
-    res.status(500).json({
-      sucesso: false,
-      erro: {
-        codigo: 'ERRO_VERIFICACAO',
-        mensagem: 'Erro ao verificar status',
-        codigoStatus: 500,
-      },
-    });
+    res.status(500).json({ sucesso: false, erro: { codigo: 'ERRO_VERIFICACAO', mensagem: 'Erro ao verificar status', codigoStatus: 500 } });
   }
 });
 
 // POST /api/v1/whatsapp/grupos/sincronizar
 router.post('/grupos/sincronizar', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
   const usuarioId = req.usuario!.id;
-
   try {
     const instancia = await pool.query(
-      `SELECT * FROM whatsapp_instances
-       WHERE usuario_id = $1 AND status = 'conectado' AND deletado_em IS NULL
-       LIMIT 1`,
+      `SELECT * FROM whatsapp_instances WHERE usuario_id = $1 ORDER BY criado_em DESC LIMIT 1`,
       [usuarioId]
     );
 
     if (instancia.rows.length === 0) {
-      res.status(400).json({
-        sucesso: false,
-        erro: {
-          codigo: 'WHATSAPP_NAO_CONECTADO',
-          mensagem: 'WhatsApp não está conectado',
-          codigoStatus: 400,
-        },
-      });
+      res.status(400).json({ sucesso: false, erro: { codigo: 'WHATSAPP_NAO_CONECTADO', mensagem: 'WhatsApp não está conectado', codigoStatus: 400 } });
       return;
     }
 
     const jobResult = await pool.query(
-      `INSERT INTO whatsapp_sync_jobs
-       (usuario_id, instancia_nome, status, mensagem, iniciado_em)
-       VALUES ($1, $2, 'rodando', 'Sincronizando grupos...', NOW())
-       RETURNING *`,
+      `INSERT INTO whatsapp_sync_jobs (usuario_id, instancia_nome, status, mensagem, iniciado_em)
+       VALUES ($1, $2, 'rodando', 'Sincronizando grupos...', NOW()) RETURNING *`,
       [usuarioId, instancia.rows[0].nome_instancia]
     );
-
     const job = jobResult.rows[0];
 
-    await filaSync.add(
-      'sincronizar-grupos',
-      { jobId: job.id, usuarioId, instancia: instancia.rows[0].nome_instancia },
-      { priority: 10, attempts: 3, backoff: { type: 'exponential', delay: 2000 } }
-    );
-
-    res.status(202).json({
-      sucesso: true,
-      job: {
-        id: job.id,
-        status: job.status,
-        mensagem: job.mensagem,
-        iniciado_em: job.iniciado_em,
-      },
+    await filaSync.add('sincronizar-grupos', { jobId: job.id, usuarioId, instancia: instancia.rows[0].nome_instancia }, {
+      priority: 10, attempts: 3, backoff: { type: 'exponential', delay: 2000 },
     });
+
+    res.status(202).json({ sucesso: true, job: { id: job.id, status: job.status, mensagem: job.mensagem, iniciado_em: job.iniciado_em } });
   } catch (erro: unknown) {
     logger.error({ erro, usuarioId }, 'Erro ao sincronizar grupos');
-    res.status(500).json({
-      sucesso: false,
-      erro: {
-        codigo: 'ERRO_SYNC',
-        mensagem: 'Erro ao iniciar sincronização',
-        codigoStatus: 500,
-      },
-    });
+    res.status(500).json({ sucesso: false, erro: { codigo: 'ERRO_SYNC', mensagem: 'Erro ao iniciar sincronização', codigoStatus: 500 } });
   }
 });
 
@@ -312,43 +237,23 @@ router.post('/grupos/sincronizar', autenticacaoRequerida, async (req: RequestCom
 router.get(
   '/grupos/status-sync',
   autenticacaoRequerida,
-  [query('jobId').notEmpty().withMessage('jobId é obrigatório')],
+  [queryValidator('jobId').notEmpty().withMessage('jobId é obrigatório')],
   async (req: RequestComUsuario, res: Response): Promise<void> => {
     const usuarioId = req.usuario!.id;
     const { jobId } = req.query as { jobId: string };
-
     try {
       const resultado = await pool.query(
-        `SELECT * FROM whatsapp_sync_jobs
-         WHERE id = $1 AND usuario_id = $2`,
+        `SELECT * FROM whatsapp_sync_jobs WHERE id = $1 AND usuario_id = $2`,
         [jobId, usuarioId]
       );
-
       if (resultado.rows.length === 0) {
         res.status(404).json({ sucesso: false, erro: { codigo: 'JOB_NAO_ENCONTRADO', mensagem: 'Job não encontrado', codigoStatus: 404 } });
         return;
       }
-
       const job = resultado.rows[0];
-
-      res.json({
-        sucesso: true,
-        job: {
-          id: job.id,
-          status: job.status,
-          mensagem: job.mensagem,
-          totalRecebidos: job.total_recebidos,
-          salvos: job.salvos,
-          ignorados: job.ignorados,
-          finalizadoEm: job.finalizado_em,
-        },
-      });
+      res.json({ sucesso: true, job: { id: job.id, status: job.status, mensagem: job.mensagem, totalRecebidos: job.total_recebidos, salvos: job.salvos, ignorados: job.ignorados, finalizadoEm: job.finalizado_em } });
     } catch (erro: unknown) {
-      logger.error({ erro }, 'Erro ao obter status do job');
-      res.status(500).json({
-        sucesso: false,
-        erro: { codigo: 'ERRO_STATUS_JOB', mensagem: 'Erro ao obter status', codigoStatus: 500 },
-      });
+      res.status(500).json({ sucesso: false, erro: { codigo: 'ERRO_STATUS_JOB', mensagem: 'Erro ao obter status', codigoStatus: 500 } });
     }
   }
 );
@@ -367,10 +272,7 @@ router.post(
   async (req: RequestComUsuario, res: Response): Promise<void> => {
     const erros = validationResult(req);
     if (!erros.isEmpty()) {
-      res.status(400).json({
-        sucesso: false,
-        erro: { codigo: 'ERRO_VALIDACAO', mensagem: erros.array()[0].msg, codigoStatus: 400 },
-      });
+      res.status(400).json({ sucesso: false, erro: { codigo: 'ERRO_VALIDACAO', mensagem: erros.array()[0].msg, codigoStatus: 400 } });
       return;
     }
 
@@ -383,47 +285,19 @@ router.post(
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-
-      await client.query(
-        `UPDATE usuario_whatsapp_grupos SET deletado_em = NOW()
-         WHERE usuario_id = $1 AND deletado_em IS NULL`,
-        [usuarioId]
-      );
-
+      await client.query(`UPDATE usuario_whatsapp_grupos SET deletado_em = NOW() WHERE usuario_id = $1 AND deletado_em IS NULL`, [usuarioId]);
       for (const grupo of gruposOrigem) {
-        await client.query(
-          `INSERT INTO usuario_whatsapp_grupos (usuario_id, group_jid, nome, papel, nicho)
-           VALUES ($1, $2, $3, 'origem', $4)`,
-          [usuarioId, grupo.groupJid, grupo.nome, grupo.nicho]
-        );
+        await client.query(`INSERT INTO usuario_whatsapp_grupos (usuario_id, group_jid, nome, papel, nicho) VALUES ($1, $2, $3, 'origem', $4)`, [usuarioId, grupo.groupJid, grupo.nome, grupo.nicho]);
       }
-
       for (const grupo of gruposDestino) {
-        await client.query(
-          `INSERT INTO usuario_whatsapp_grupos (usuario_id, group_jid, nome, papel, nicho)
-           VALUES ($1, $2, $3, 'destino', $4)`,
-          [usuarioId, grupo.groupJid, grupo.nome, grupo.nicho]
-        );
+        await client.query(`INSERT INTO usuario_whatsapp_grupos (usuario_id, group_jid, nome, papel, nicho) VALUES ($1, $2, $3, 'destino', $4)`, [usuarioId, grupo.groupJid, grupo.nome, grupo.nicho]);
       }
-
       await client.query('COMMIT');
-
-      res.json({
-        sucesso: true,
-        mensagem: 'Configuração salva com sucesso',
-        resumo: {
-          gruposOrigemAtivos: gruposOrigem.filter((g) => g.statusAtivo !== false).length,
-          gruposDestinoAtivos: gruposDestino.filter((g) => g.statusAtivo !== false).length,
-          automatizacaoPronta: true,
-        },
-      });
+      res.json({ sucesso: true, mensagem: 'Configuração salva com sucesso', resumo: { gruposOrigemAtivos: gruposOrigem.length, gruposDestinoAtivos: gruposDestino.length, automatizacaoPronta: true } });
     } catch (erro: unknown) {
       await client.query('ROLLBACK');
       logger.error({ erro, usuarioId }, 'Erro ao salvar grupos');
-      res.status(500).json({
-        sucesso: false,
-        erro: { codigo: 'ERRO_SALVAR_GRUPOS', mensagem: 'Erro ao salvar configuração', codigoStatus: 500 },
-      });
+      res.status(500).json({ sucesso: false, erro: { codigo: 'ERRO_SALVAR_GRUPOS', mensagem: 'Erro ao salvar configuração', codigoStatus: 500 } });
     } finally {
       client.release();
     }
@@ -435,39 +309,15 @@ router.get('/dashboard', autenticacaoRequerida, async (req: RequestComUsuario, r
   const usuarioId = req.usuario!.id;
   try {
     const [instanciaResult, gruposResult] = await Promise.all([
-      pool.query(
-        `SELECT nome_instancia AS instance_name, telefone AS phone, status
-         FROM whatsapp_instances
-         WHERE usuario_id = $1 AND deletado_em IS NULL
-         ORDER BY criado_em DESC LIMIT 1`,
-        [usuarioId]
-      ),
-      pool.query(
-        `SELECT id, nome AS group_name, group_jid, nicho AS niche, papel AS role
-         FROM usuario_whatsapp_grupos
-         WHERE usuario_id = $1 AND deletado_em IS NULL
-         ORDER BY papel, nome`,
-        [usuarioId]
-      ),
+      pool.query(`SELECT nome_instancia AS instance_name, telefone AS phone, status FROM whatsapp_instances WHERE usuario_id = $1 ORDER BY criado_em DESC LIMIT 1`, [usuarioId]),
+      pool.query(`SELECT id, nome AS group_name, group_jid, nicho AS niche, papel AS role FROM usuario_whatsapp_grupos WHERE usuario_id = $1 AND deletado_em IS NULL ORDER BY papel, nome`, [usuarioId]),
     ]);
-
     const instance = instanciaResult.rows.length > 0 ? instanciaResult.rows[0] : null;
     const todosGrupos = gruposResult.rows as { id: string; group_name: string; group_jid: string; niche: string; role: string }[];
     const originGroups = todosGrupos.filter((g) => g.role === 'origem').map((g) => ({ ...g, status: 'active' }));
     const destinationGroups = todosGrupos.filter((g) => g.role === 'destino').map((g) => ({ ...g, status: 'active' }));
-
-    res.json({
-      sucesso: true,
-      instance,
-      summary: {
-        total_groups: todosGrupos.length,
-        origin_groups: originGroups.length,
-        destination_groups: destinationGroups.length,
-      },
-      originGroups,
-      destinationGroups,
-    });
-  } catch (erro) {
+    res.json({ sucesso: true, instance, summary: { total_groups: todosGrupos.length, origin_groups: originGroups.length, destination_groups: destinationGroups.length }, originGroups, destinationGroups });
+  } catch (erro: unknown) {
     logger.error({ erro }, 'Erro ao buscar dashboard WhatsApp');
     res.status(500).json({ sucesso: false, erro: { codigo: 'ERRO_INTERNO', mensagem: 'Erro interno', codigoStatus: 500 } });
   }
@@ -478,14 +328,11 @@ router.get('/grupos', autenticacaoRequerida, async (req: RequestComUsuario, res:
   const usuarioId = req.usuario!.id;
   try {
     const resultado = await pool.query(
-      `SELECT id, group_jid, nome, papel, nicho
-       FROM usuario_whatsapp_grupos
-       WHERE usuario_id = $1 AND deletado_em IS NULL
-       ORDER BY papel, nome`,
+      `SELECT id, group_jid, nome, papel, nicho FROM usuario_whatsapp_grupos WHERE usuario_id = $1 AND deletado_em IS NULL ORDER BY papel, nome`,
       [usuarioId]
     );
     res.json({ sucesso: true, grupos: resultado.rows });
-  } catch (erro) {
+  } catch (erro: unknown) {
     logger.error({ erro }, 'Erro ao buscar grupos WhatsApp');
     res.status(500).json({ sucesso: false, erro: { codigo: 'ERRO_INTERNO', mensagem: 'Erro interno', codigoStatus: 500 } });
   }
