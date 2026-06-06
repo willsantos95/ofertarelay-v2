@@ -1,16 +1,9 @@
 import rateLimit from 'express-rate-limit';
-import { RedisStore } from 'rate-limit-redis';
-import { redisClient } from '../config/redis';
 
-function criarStore(prefix: string) {
-  return new RedisStore({
-    sendCommand: (...args: string[]) => redisClient.sendCommand(args),
-    prefix,
-  });
-}
+// Usa MemoryStore (sem dependência de Redis para rate limiting)
+// Funciona perfeitamente para instância única — Redis continua usado só para Bull queue
 
 export const limitadorRegistro = rateLimit({
-  store: criarStore('rl:registrar:'),
   windowMs: 60 * 60 * 1000,
   max: 10,
   message: {
@@ -28,7 +21,6 @@ export const limitadorRegistro = rateLimit({
 });
 
 export const limitadorEntrada = rateLimit({
-  store: criarStore('rl:entrar:'),
   windowMs: 5 * 60 * 1000,
   max: 5,
   message: {
@@ -45,7 +37,6 @@ export const limitadorEntrada = rateLimit({
 });
 
 export const limitadorWebhook = rateLimit({
-  store: criarStore('rl:webhook:'),
   windowMs: 60 * 1000,
   max: parseInt(process.env.WEBHOOK_RATE_LIMIT || '100'),
   message: {
@@ -62,7 +53,6 @@ export const limitadorWebhook = rateLimit({
 
 export function criarLimitadorN8n(prefix: string, max: number) {
   return rateLimit({
-    store: criarStore(`rl:n8n:${prefix}:`),
     windowMs: 60 * 1000,
     max,
     keyGenerator: (req) => {
