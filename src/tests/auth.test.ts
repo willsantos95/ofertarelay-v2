@@ -133,7 +133,7 @@ describe('Auth Module', () => {
 
   // Teste 7: Login com credenciais válidas
   test('POST /entrar com credenciais válidas → 200', async () => {
-    const bcryptMod = await import('bcrypt');
+    const bcryptMod = await import('bcryptjs');
     const senhaHash = await bcryptMod.hash('123456', 10);
     mockPool.query.mockResolvedValueOnce({
       rows: [{ ...USUARIO_DB, senha_hash: senhaHash }],
@@ -152,7 +152,7 @@ describe('Auth Module', () => {
 
   // Teste 8: Login com senha errada → 401 (mensagem genérica)
   test('POST /entrar com senha errada → 401 genérico', async () => {
-    const bcryptMod = await import('bcrypt');
+    const bcryptMod = await import('bcryptjs');
     const senhaHash = await bcryptMod.hash('123456', 10);
     mockPool.query.mockResolvedValueOnce({
       rows: [{ ...USUARIO_DB, senha_hash: senhaHash }],
@@ -192,7 +192,7 @@ describe('Auth Module', () => {
 
   // Teste 11: Token em cookie HttpOnly
   test('POST /entrar retorna cookie auth_token', async () => {
-    const bcryptMod = await import('bcrypt');
+    const bcryptMod = await import('bcryptjs');
     const senhaHash = await bcryptMod.hash('123456', 10);
     mockPool.query.mockResolvedValueOnce({
       rows: [{ ...USUARIO_DB, senha_hash: senhaHash }],
