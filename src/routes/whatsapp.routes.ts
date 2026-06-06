@@ -81,48 +81,51 @@ router.post(
       let codigoPareamento: string | null = null;
 
       try {
+        // Tentar criar instância — se já existe (403/400), apenas buscar o QR
         const respostaCreate = await fetchEvolution('/instance/create', {
           method: 'POST',
-          body: JSON.stringify({ instanceName: nomeInstancia, qrcode: true, integration: 'WHATSAPP-BAILEYS' }),
-          signal: AbortSignal.timeout(10000),
+          body: JSON.stringify({
+            instanceName: nomeInstancia,
+            qrcode: true,
+            integration: 'WHATSAPP-BAILEYS',
+            number: telefone,
+          }),
+          signal: AbortSignal.timeout(15000),
         });
 
-        if (!respostaCreate.ok) {
-          throw new Error(`Evolution retornou ${respostaCreate.status}`);
+        type QRResp = { base64?: string; code?: string; pairingCode?: string; qrcode?: string };
+        type CreateResp = { qrcode?: QRResp; instance?: { instanceName?: string } };
+
+        let qrDados: QRResp | null = null;
+
+        if (respostaCreate.ok) {
+          const dadosCreate = await respostaCreate.json() as CreateResp;
+          // QR pode vir dentro de qrcode.base64 (v2) ou direto
+          if (dadosCreate.qrcode?.base64) {
+            qrDados = dadosCreate.qrcode;
+          }
         }
 
-        const respostaQR = await fetchEvolution(`/instance/connect/${nomeInstancia}`, {
-          signal: AbortSignal.timeout(5000),
-        });
+        // Se não veio QR no create (ou 403 = instância já existe), buscar via /connect
+        if (!qrDados) {
+          const respostaQR = await fetchEvolution(`/instance/connect/${nomeInstancia}`, {
+            signal: AbortSignal.timeout(8000),
+          });
+          if (respostaQR.ok) {
+            qrDados = await respostaQR.json() as QRResp;
+          }
+        }
 
-        if (respostaQR.ok) {
-          const dadosQR = await respostaQR.json() as {
-            qrcode?: string;
-            pairingCode?: string;
-          };
-          qrcode = dadosQR.qrcode || null;
-          codigoPareamento = dadosQR.pairingCode || null;
+        if (qrDados) {
+          const qrRaw = qrDados.base64 || qrDados.qrcode || null;
+          qrcode = qrRaw
+            ? (qrRaw.startsWith('data:') ? qrRaw : `data:image/png;base64,${qrRaw}`)
+            : null;
+          codigoPareamento = qrDados.pairingCode || qrDados.code || null;
         }
       } catch (err) {
-        logger.warn({ err, telefone }, 'Erro Evolution na 1ª tentativa, retrying...');
-        await new Promise((r) => setTimeout(r, 1000));
-
-        // Segunda tentativa
-        try {
-          const respostaQR2 = await fetchEvolution(`/instance/connect/${nomeInstancia}`, {
-            signal: AbortSignal.timeout(5000),
-          });
-          if (respostaQR2.ok) {
-            const dadosQR2 = await respostaQR2.json() as {
-              qrcode?: string;
-              pairingCode?: string;
-            };
-            qrcode = dadosQR2.qrcode || null;
-            codigoPareamento = dadosQR2.pairingCode || null;
-          }
-        } catch (err2) {
-          logger.error({ err2 }, 'Falha no retry Evolution');
-        }
+        logger.warn({ err, telefone, msg: (err as Error).message }, 'Erro Evolution — sem QR code');
+        // não fazer retry — logar o erro detalhado e deixar o frontend mostrar
       }
 
       const resultado = await pool.query(
