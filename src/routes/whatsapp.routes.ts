@@ -391,7 +391,7 @@ router.get('/dashboard', autenticacaoRequerida, async (req: RequestComUsuario, r
   }
 });
 
-// GET /api/v1/whatsapp/grupos
+// GET /api/v1/whatsapp/grupos — grupos salvos (origem/destino configurados)
 router.get('/grupos', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
   const usuarioId = req.usuario!.id;
   try {
@@ -402,6 +402,48 @@ router.get('/grupos', autenticacaoRequerida, async (req: RequestComUsuario, res:
     res.json({ sucesso: true, grupos: resultado.rows });
   } catch (erro: unknown) {
     logger.error({ erro }, 'Erro ao buscar grupos WhatsApp');
+    res.status(500).json({ sucesso: false, erro: { codigo: 'ERRO_INTERNO', mensagem: 'Erro interno', codigoStatus: 500 } });
+  }
+});
+
+// GET /api/v1/whatsapp/grupos/cache — todos os grupos sincronizados da Evolution
+router.get('/grupos/cache', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
+  const usuarioId = req.usuario!.id;
+  try {
+    const instanciaResult = await pool.query(
+      `SELECT nome_instancia FROM whatsapp_instances WHERE usuario_id = $1 ORDER BY criado_em DESC LIMIT 1`,
+      [usuarioId]
+    );
+
+    if (instanciaResult.rows.length === 0) {
+      res.json({ sucesso: true, grupos: [] });
+      return;
+    }
+
+    const nomeInstancia = instanciaResult.rows[0].nome_instancia as string;
+
+    // Busca do cache com info de seleção já configurada
+    const resultado = await pool.query(
+      `SELECT
+         c.group_jid,
+         c.group_nome AS group_name,
+         c.participantes AS participants_count,
+         c.sincronizado_em AS synced_at,
+         COALESCE(BOOL_OR(uwg.papel = 'origem' AND uwg.deletado_em IS NULL), false) AS is_origin,
+         COALESCE(BOOL_OR(uwg.papel = 'destino' AND uwg.deletado_em IS NULL), false) AS is_destination,
+         COALESCE(MAX(uwg.nicho), 'geral') AS nicho
+       FROM whatsapp_group_cache c
+       LEFT JOIN usuario_whatsapp_grupos uwg
+         ON uwg.usuario_id = c.usuario_id AND uwg.group_jid = c.group_jid
+       WHERE c.usuario_id = $1 AND c.instancia_nome = $2
+       GROUP BY c.group_jid, c.group_nome, c.participantes, c.sincronizado_em
+       ORDER BY c.group_nome ASC`,
+      [usuarioId, nomeInstancia]
+    );
+
+    res.json({ sucesso: true, grupos: resultado.rows });
+  } catch (erro: unknown) {
+    logger.error({ erro }, 'Erro ao buscar cache de grupos');
     res.status(500).json({ sucesso: false, erro: { codigo: 'ERRO_INTERNO', mensagem: 'Erro interno', codigoStatus: 500 } });
   }
 });
