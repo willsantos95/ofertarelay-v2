@@ -131,6 +131,25 @@ router.post('/itens', autenticacaoRequerida, async (req: RequestComUsuario, res:
   }
 });
 
+// PATCH /api/v1/agendamento/itens/:id  — atualiza a legenda de um item pendente
+router.patch('/itens/:id', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
+  const { legenda } = req.body as { legenda?: string };
+  if (!legenda || !legenda.trim()) {
+    res.status(400).json({ sucesso: false, erro: { mensagem: 'Legenda vazia.' } });
+    return;
+  }
+  try {
+    const r = await pool.query(
+      `UPDATE agendamento_itens SET legenda = $1
+       WHERE id = $2 AND usuario_id = $3 AND status = 'pendente'`,
+      [legenda, req.params.id, req.usuario!.id]
+    );
+    res.json({ sucesso: true, atualizado: (r.rowCount ?? 0) > 0 });
+  } catch (erro) {
+    res.status(500).json({ sucesso: false, erro: { mensagem: (erro as Error).message } });
+  }
+});
+
 // DELETE /api/v1/agendamento/itens/:id  — remove um item
 router.delete('/itens/:id', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
   try {

@@ -1,49 +1,15 @@
 import { Router, Request, Response } from 'express';
-import crypto from 'crypto';
 import { parse as parseHtml } from 'node-html-parser';
 import { pool } from '../config/database';
 import { autenticacaoRequerida, RequestComUsuario } from '../middleware/authRequired';
 import { logger } from '../utils/logger';
 import { enviarOfertaWhatsApp, enviarOfertaTelegram } from '../services/envio.service';
 import { melhorarLegendaIA, iaConfigurada } from '../services/ia.service';
+import {
+  getShopeeCredenciais, getMLCredenciais, shopeeSign, gerarLinkAfiliadoML,
+} from '../services/afiliado.service';
 
 const router = Router();
-
-// ─────────────────────────────────────────────
-// Helpers de credenciais
-// ─────────────────────────────────────────────
-
-async function getShopeeCredenciais(usuarioId: string) {
-  // 1. Tenta credenciais do usuário (página Afiliado)
-  const r = await pool.query(
-    `SELECT payload FROM user_settings WHERE usuario_id = $1 AND tipo = 'affiliate'`,
-    [usuarioId]
-  );
-  const shopee = r.rows.length
-    ? (r.rows[0].payload as Record<string, Record<string, string>>)?.shopee
-    : null;
-
-  const appId     = shopee?.appId     || process.env.SHOPEE_APP_ID  || '';
-  const appSecret = shopee?.appSecret || process.env.SHOPEE_SECRET  || '';
-
-  if (!appId || !appSecret) return null;
-  return { appId, appSecret };
-}
-
-async function getMLCredenciais(usuarioId: string) {
-  const r = await pool.query(
-    `SELECT payload FROM user_settings WHERE usuario_id = $1 AND tipo = 'affiliate'`,
-    [usuarioId]
-  );
-  if (!r.rows.length) return null;
-  const ml = (r.rows[0].payload as Record<string, Record<string, string>>)?.mercadoLivre;
-  if (!ml?.tag || !ml?.cookies) return null;
-  const urls = (ml.urls || '')
-    .split('\n')
-    .map((u: string) => u.trim())
-    .filter((u: string) => u.startsWith('http'));
-  return { tag: ml.tag, cookies: ml.cookies, urls };
-}
 
 // ─────────────────────────────────────────────
 // SHOPEE
@@ -94,12 +60,6 @@ interface ProdutoShopee {
   commission: string | number; imageUrl: string;
   price: string | number; productLink: string;
   offerLink: string; productName: string;
-}
-
-function shopeeSign(appId: string, ts: string, payload: object, secret: string) {
-  return crypto.createHash('sha256')
-    .update(`${appId}${ts}${JSON.stringify(payload)}${secret}`)
-    .digest('hex');
 }
 
 /** Monta os argumentos do productOfferV2 a partir de um objeto. */
@@ -273,117 +233,6 @@ async function scrapeMLPage(url: string, cookies = ''): Promise<MLProduto[]> {
   }
 
   return produtos;
-}
-
-const ML_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Edg/144.0.0.0';
-
-/**
- * Mescla cookies antigos com os novos set-cookie da resposta.
- * Igual ao "merge cookies" do workflow n8n de referência.
- */
-function mergeCookies(oldCookies: string, setCookieHeaders: string[]): string {
-  const map: Record<string, string> = {};
-
-  // Parsear cookies existentes
-  oldCookies.split(';').forEach((c) => {
-    const idx = c.trim().indexOf('=');
-    if (idx > 0) {
-      map[c.trim().slice(0, idx).trim()] = c.trim().slice(idx + 1).trim();
-    }
-  });
-
-  // Sobrescrever com os novos set-cookie (apenas a parte nome=valor, ignorar path/expires/etc.)
-  setCookieHeaders.forEach((header) => {
-    const part = header.split(';')[0].trim();
-    const idx  = part.indexOf('=');
-    if (idx > 0) {
-      map[part.slice(0, idx).trim()] = part.slice(idx + 1).trim();
-    }
-  });
-
-  return Object.entries(map).map(([k, v]) => `${k}=${v}`).join('; ');
-}
-
-/**
- * Gera link de afiliado ML com refresh de cookies:
- * 1. GET /afiliados/linkbuilder → renova cookies via set-cookie headers
- * 2. Mescla cookies antigos + novos
- * 3. POST /affiliate-program/api/v2/affiliates/createLink
- * Retorna o short_url (ex: https://meli.la/1C8Lv8i) ou null se falhar.
- */
-async function gerarLinkAfiliadoML(
-  produtoUrl: string,
-  tag: string,
-  cookies: string,
-): Promise<{ shortUrl: string | null; cookiesAtualizados: string }> {
-  if (!cookies || !tag) return { shortUrl: null, cookiesAtualizados: cookies };
-
-  let cookiesAtualizados = cookies;
-
-  // Passo 1: Renovar cookies acessando a página do linkbuilder (igual ao n8n)
-  try {
-    const refreshResp = await fetch('https://www.mercadolivre.com.br/afiliados/linkbuilder', {
-      headers: {
-        'User-Agent': ML_UA,
-        'accept':     'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'cookie':     cookies,
-      },
-      signal: AbortSignal.timeout(15000),
-      redirect: 'follow',
-    });
-
-    // Extrair set-cookie da resposta
-    // Node 18.14+ tem getSetCookie(); fallback para get('set-cookie')
-    const raw = (refreshResp.headers as unknown as { getSetCookie?: () => string[] }).getSetCookie?.()
-      ?? [refreshResp.headers.get('set-cookie') ?? ''].filter(Boolean);
-
-    if (raw.length > 0) {
-      cookiesAtualizados = mergeCookies(cookies, raw);
-      logger.info({ tag }, 'ML cookies renovados com sucesso');
-    }
-  } catch (err) {
-    logger.warn({ err: (err as Error).message }, 'ML: falha ao renovar cookies, usando os originais');
-  }
-
-  // Passo 2: Gerar link de afiliado com os cookies atualizados
-  try {
-    const resp = await fetch(
-      'https://www.mercadolivre.com.br/affiliate-program/api/v2/affiliates/createLink',
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type':       'application/json',
-          'accept':             'application/json, text/plain, */*',
-          'accept-language':    'en-US,en;q=0.9',
-          'origin':             'https://www.mercadolivre.com.br',
-          'referer':            'https://www.mercadolivre.com.br/afiliados/linkbuilder',
-          'user-agent':         ML_UA,
-          'sec-ch-ua':          '"Not(A:Brand";v="8", "Chromium";v="144"',
-          'sec-ch-ua-mobile':   '?0',
-          'sec-ch-ua-platform': '"macOS"',
-          'sec-fetch-dest':     'empty',
-          'sec-fetch-mode':     'cors',
-          'sec-fetch-site':     'same-origin',
-          'cookie':             cookiesAtualizados,
-        },
-        body: JSON.stringify({ urls: [produtoUrl], tag }),
-        signal: AbortSignal.timeout(15000),
-      }
-    );
-
-    if (!resp.ok) {
-      logger.warn({ status: resp.status, produtoUrl }, 'ML createLink falhou');
-      return { shortUrl: null, cookiesAtualizados };
-    }
-
-    const data = await resp.json() as { urls?: { short_url?: string }[] };
-    const shortUrl = data?.urls?.[0]?.short_url || null;
-    logger.info({ shortUrl, produtoUrl }, 'ML link de afiliado gerado');
-    return { shortUrl, cookiesAtualizados };
-  } catch (err) {
-    logger.warn({ err: (err as Error).message }, 'Erro ao gerar link afiliado ML');
-    return { shortUrl: null, cookiesAtualizados };
-  }
 }
 
 // ─────────────────────────────────────────────

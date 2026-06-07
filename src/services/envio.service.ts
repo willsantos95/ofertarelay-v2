@@ -3,6 +3,7 @@
 
 import { pool } from '../config/database';
 import { logger } from '../utils/logger';
+import { resolverLinkAfiliado } from './afiliado.service';
 
 export interface ResultadoEnvio { enviados: number; erros: string[]; }
 
@@ -38,6 +39,39 @@ async function marcarOfertaEnviada(ofertaId: string): Promise<void> {
 }
 
 /**
+ * Busca a oferta e REGERA o link de afiliado para o usuário logado no momento
+ * do envio, substituindo o link antigo na legenda. Garante que cada envio use
+ * o link de afiliado de quem está enviando (a tabela ofertas é global).
+ */
+async function prepararEnvio(
+  usuarioId: string, ofertaId: string, legenda: string,
+): Promise<{ imagemUrl: string | null; legenda: string }> {
+  const r = await pool.query(
+    'SELECT imagem_url, link_produto, link_afiliado, plataforma FROM ofertas WHERE id = $1',
+    [ofertaId]
+  );
+  if (!r.rows.length) throw new Error('Oferta não encontrada.');
+  const o = r.rows[0] as {
+    imagem_url: string | null; link_produto: string | null;
+    link_afiliado: string | null; plataforma: string;
+  };
+
+  const linkAntigo = o.link_afiliado || o.link_produto || '';
+  let legendaFinal = legenda;
+
+  try {
+    const linkNovo = await resolverLinkAfiliado(usuarioId, o);
+    if (linkNovo && linkAntigo && linkNovo !== linkAntigo && legendaFinal.includes(linkAntigo)) {
+      legendaFinal = legendaFinal.split(linkAntigo).join(linkNovo);
+    }
+  } catch (e) {
+    logger.warn({ ofertaId, err: (e as Error).message }, 'Falha ao regenerar link no envio; usando legenda original');
+  }
+
+  return { imagemUrl: o.imagem_url, legenda: legendaFinal };
+}
+
+/**
  * Envia uma oferta para grupos de WhatsApp via Evolution API.
  * Se `grupos` não vier, usa os grupos de destino configurados do usuário.
  * Lança Error em problemas de configuração (sem instância/sem grupos).
@@ -45,9 +79,7 @@ async function marcarOfertaEnviada(ofertaId: string): Promise<void> {
 export async function enviarOfertaWhatsApp(
   usuarioId: string, ofertaId: string, legenda: string, grupos?: string[],
 ): Promise<ResultadoEnvio> {
-  const ofertaResult = await pool.query('SELECT imagem_url FROM ofertas WHERE id = $1', [ofertaId]);
-  if (!ofertaResult.rows.length) throw new Error('Oferta não encontrada.');
-  const oferta = ofertaResult.rows[0] as { imagem_url: string | null };
+  const { imagemUrl, legenda: legendaFinal } = await prepararEnvio(usuarioId, ofertaId, legenda);
 
   const instResult = await pool.query(
     `SELECT nome_instancia FROM whatsapp_instances
@@ -79,12 +111,12 @@ export async function enviarOfertaWhatsApp(
       let endpoint: string;
       let body: Record<string, unknown>;
 
-      if (oferta.imagem_url) {
+      if (imagemUrl) {
         endpoint = `/message/sendMedia/${nomeInstancia}`;
-        body = { number: groupJid, mediatype: 'image', media: oferta.imagem_url, mimetype: 'image/jpeg', caption: legenda };
+        body = { number: groupJid, mediatype: 'image', media: imagemUrl, mimetype: 'image/jpeg', caption: legendaFinal };
       } else {
         endpoint = `/message/sendText/${nomeInstancia}`;
-        body = { number: groupJid, text: legenda };
+        body = { number: groupJid, text: legendaFinal };
       }
 
       const resp = await fetch(`${evoUrl}${endpoint}`, {
@@ -126,9 +158,7 @@ export async function enviarOfertaTelegram(
   const destinos: string[] = chatIds?.length ? chatIds : (tg.chatIds || []);
   if (!destinos.length) throw new Error('Nenhum Chat ID configurado no Telegram.');
 
-  const ofertaResult = await pool.query('SELECT imagem_url FROM ofertas WHERE id = $1', [ofertaId]);
-  if (!ofertaResult.rows.length) throw new Error('Oferta não encontrada.');
-  const oferta = ofertaResult.rows[0] as { imagem_url: string | null };
+  const { imagemUrl, legenda: legendaFinal } = await prepararEnvio(usuarioId, ofertaId, legenda);
 
   const enviados: string[] = [];
   const erros: string[] = [];
@@ -138,12 +168,12 @@ export async function enviarOfertaTelegram(
       let endpoint: string;
       let body: Record<string, unknown>;
 
-      if (oferta.imagem_url) {
+      if (imagemUrl) {
         endpoint = `https://api.telegram.org/bot${tg.botToken}/sendPhoto`;
-        body = { chat_id: chatId, photo: oferta.imagem_url, caption: legenda, parse_mode: 'Markdown' };
+        body = { chat_id: chatId, photo: imagemUrl, caption: legendaFinal, parse_mode: 'Markdown' };
       } else {
         endpoint = `https://api.telegram.org/bot${tg.botToken}/sendMessage`;
-        body = { chat_id: chatId, text: legenda, parse_mode: 'Markdown' };
+        body = { chat_id: chatId, text: legendaFinal, parse_mode: 'Markdown' };
       }
 
       const resp = await fetch(endpoint, {
