@@ -21,21 +21,16 @@ async function getShopeeCredenciais(usuarioId: string): Promise<{ appId: string;
   return { appId: shopee.appId, appSecret: shopee.appSecret };
 }
 
-// Categorias a sincronizar (mesmas do workflow n8n de referência)
-const CATEGORIAS = [
-  { id: 100013, nome: 'Eletrônicos'        },
-  { id: 100011, nome: 'Eletrodomésticos'   },
-  { id: 100003, nome: 'Utensílios Casa'    },
-  { id: 100062, nome: 'Perfumes'           },
-  { id: 100017, nome: 'Roupas'             },
-  { id: 100018, nome: 'Calçados'           },
-  { id: 10053,  nome: 'Suplementos'        },
-  { id: 100055, nome: 'Produtos Higiene'   },
+// Tipos de listagem da API Shopee (sem IDs de categoria — não precisam de productCatId)
+// listType: 1 = top produtos por comissão | listType: 2 = flash sale
+const LISTAS_SHOPEE = [
+  { listType: 1, nome: 'Top Comissão' },
+  { listType: 2, nome: 'Flash Sale'   },
 ];
 
-// Filtros mínimos (semelhantes ao n8n: preço > R$20 e comissão > 5%)
-const MIN_PRECO      = 20;
-const MIN_COMISSAO   = 0.05;
+// Filtros mínimos (preço > R$20 e comissão > 5%)
+const MIN_PRECO    = 20;
+const MIN_COMISSAO = 0.05;
 
 interface ProdutoShopee {
   itemId:         string;
@@ -58,13 +53,14 @@ function shopeeSign(appId: string, timestamp: string, payload: object, secret: s
 }
 
 /**
- * Busca ofertas de uma categoria na API Shopee Affiliate.
+ * Busca ofertas pelo tipo de listagem (sem filtro de categoria).
+ * listType: 1 = top comissão, listType: 2 = flash sale
  */
-async function buscarCategoria(categoriaId: number, appId: string, secret: string): Promise<ProdutoShopee[]> {
+async function buscarLista(listType: number, appId: string, secret: string): Promise<ProdutoShopee[]> {
   const timestamp = Math.floor(Date.now() / 1000).toString();
 
   const payload = {
-    query: `{ productOfferV2(listType: 0, productCatId: ${categoriaId}, limit: 20) { nodes { itemId commissionRate commission imageUrl price productLink offerLink productName } } }`,
+    query: `{ productOfferV2(listType: ${listType}, limit: 50) { nodes { itemId commissionRate commission imageUrl price productLink offerLink productName } } }`,
   };
 
   const signature = shopeeSign(appId, timestamp, payload, secret);
@@ -110,14 +106,14 @@ router.post('/sincronizar', autenticacaoRequerida, async (req: RequestComUsuario
     let totalIgnorados = 0;
     const errosCat: string[] = [];
 
-    for (const cat of CATEGORIAS) {
+    for (const lista of LISTAS_SHOPEE) {
       try {
-        const produtos = await buscarCategoria(cat.id, creds.appId, creds.appSecret);
+        const produtos = await buscarLista(lista.listType, creds.appId, creds.appSecret);
 
         for (const p of produtos) {
-          const preco         = parseFloat(String(p.price));
-          const taxaComissao  = parseFloat(String(p.commissionRate));
-          const comissao      = parseFloat(String(p.commission));
+          const preco        = parseFloat(String(p.price));
+          const taxaComissao = parseFloat(String(p.commissionRate));
+          const comissao     = parseFloat(String(p.commission));
 
           // Aplicar filtros mínimos
           if (preco < MIN_PRECO || taxaComissao < MIN_COMISSAO) {
@@ -128,8 +124,8 @@ router.post('/sincronizar', autenticacaoRequerida, async (req: RequestComUsuario
           const result = await pool.query(
             `INSERT INTO ofertas
                (item_id, nome, preco, imagem_url, link_produto, link_afiliado,
-                comissao, taxa_comissao, categoria_id, categoria_nome, status)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pendente')
+                comissao, taxa_comissao, categoria_nome, status)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pendente')
              ON CONFLICT (item_id) DO UPDATE SET
                preco         = EXCLUDED.preco,
                link_afiliado = EXCLUDED.link_afiliado,
@@ -145,8 +141,7 @@ router.post('/sincronizar', autenticacaoRequerida, async (req: RequestComUsuario
               p.offerLink,
               isNaN(comissao) ? null : comissao,
               taxaComissao,
-              cat.id,
-              cat.nome,
+              lista.nome,  // "Top Comissão" ou "Flash Sale"
             ]
           );
 
@@ -154,8 +149,8 @@ router.post('/sincronizar', autenticacaoRequerida, async (req: RequestComUsuario
           else totalIgnorados++;
         }
       } catch (err) {
-        logger.warn({ categoria: cat.nome, err: (err as Error).message }, 'Erro ao buscar categoria Shopee');
-        errosCat.push(`${cat.nome}: ${(err as Error).message}`);
+        logger.warn({ lista: lista.nome, err: (err as Error).message }, 'Erro ao buscar lista Shopee');
+        errosCat.push(`${lista.nome}: ${(err as Error).message}`);
       }
     }
 
