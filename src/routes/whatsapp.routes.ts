@@ -222,11 +222,22 @@ router.get('/status', autenticacaoRequerida, async (req: RequestComUsuario, res:
       `UPDATE whatsapp_instances
        SET status    = $1,
            owner_jid = COALESCE($2, owner_jid),
-           owner_lid = COALESCE($3, owner_lid),
            atualizado_em = NOW()
-       WHERE id = $4`,
-      [statusAtual, ownerJid, ownerLid, instancia.id]
+       WHERE id = $3`,
+      [statusAtual, ownerJid, instancia.id]
     );
+
+    // Salvar owner_lid separadamente para não falhar se a coluna ainda não existir no DB
+    if (ownerLid) {
+      try {
+        await pool.query(
+          `UPDATE whatsapp_instances SET owner_lid = COALESCE($1, owner_lid) WHERE id = $2`,
+          [ownerLid, instancia.id]
+        );
+      } catch {
+        // Coluna ainda não existe — ignorar até a migration 009 ser executada
+      }
+    }
 
     res.json({
       sucesso: true,
