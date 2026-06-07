@@ -34,12 +34,7 @@ async function getMLCredenciais(usuarioId: string) {
     .split('\n')
     .map((u: string) => u.trim())
     .filter((u: string) => u.startsWith('http'));
-  return {
-    tag:       ml.tag,
-    cookies:   ml.cookies,
-    csrfToken: ml.csrfToken || '',   // x-csrf-token header (diferente do cookie _csrf)
-    urls,
-  };
+  return { tag: ml.tag, cookies: ml.cookies, urls };
 }
 
 // ─────────────────────────────────────────────
@@ -204,16 +199,11 @@ async function scrapeMLPage(url: string, cookies = ''): Promise<MLProduto[]> {
   return produtos;
 }
 
-/**
- * Gera link de afiliado do ML via API do programa de afiliados.
- * csrfToken = valor do header x-csrf-token (diferente do cookie _csrf).
- * O usuário obtém copiando de F12 → Network → qualquer req ao ML → header x-csrf-token.
- */
+/** Gera link de afiliado do ML via API do programa de afiliados */
 async function gerarLinkAfiliadoML(
   url: string,
   tag: string,
   cookies: string,
-  csrfToken: string,
 ): Promise<string | null> {
   if (!cookies || !tag) return null;
 
@@ -229,7 +219,6 @@ async function gerarLinkAfiliadoML(
           'origin':          'https://www.mercadolivre.com.br',
           'referer':         'https://www.mercadolivre.com.br/afiliados/linkbuilder',
           'user-agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'x-csrf-token':    csrfToken,
           'cookie':          cookies,
           'sec-fetch-dest':  'empty',
           'sec-fetch-mode':  'cors',
@@ -333,8 +322,8 @@ router.post('/sincronizar/mercadolivre', autenticacaoRequerida, async (req: Requ
           const { precoFinal, precoOriginal, descontoPct } = parsePrecosML(p.precoRaw);
           if (!precoFinal || precoFinal < MIN_PRECO) { totalIgnorados++; continue; }
 
-          // Gerar link de afiliado (usa csrfToken do settings; fallback para link original)
-          let linkAfiliado = await gerarLinkAfiliadoML(p.linkCompra, creds.tag, creds.cookies, creds.csrfToken);
+          // Gerar link de afiliado (fallback para link original se cookies expiraram)
+          let linkAfiliado = await gerarLinkAfiliadoML(p.linkCompra, creds.tag, creds.cookies);
           if (!linkAfiliado) linkAfiliado = p.linkCompra;
 
           const r = await pool.query(
