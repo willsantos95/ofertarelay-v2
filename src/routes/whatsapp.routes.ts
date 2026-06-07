@@ -429,12 +429,13 @@ router.get('/grupos/cache', autenticacaoRequerida, async (req: RequestComUsuario
 
     const nomeInstancia = instanciaResult.rows[0].nome_instancia as string;
 
-    // Busca do cache com info de seleção já configurada
+    // Busca do cache com info de seleção já configurada + is_admin
     const resultado = await pool.query(
       `SELECT
          c.group_jid,
          c.group_nome AS group_name,
          c.participantes AS participants_count,
+         c.is_admin,
          c.sincronizado_em AS synced_at,
          COALESCE(BOOL_OR(uwg.papel = 'origem' AND uwg.deletado_em IS NULL), false) AS is_origin,
          COALESCE(BOOL_OR(uwg.papel = 'destino' AND uwg.deletado_em IS NULL), false) AS is_destination,
@@ -443,8 +444,8 @@ router.get('/grupos/cache', autenticacaoRequerida, async (req: RequestComUsuario
        LEFT JOIN usuario_whatsapp_grupos uwg
          ON uwg.usuario_id = c.usuario_id AND uwg.group_jid = c.group_jid
        WHERE c.usuario_id = $1 AND c.instancia_nome = $2
-       GROUP BY c.group_jid, c.group_nome, c.participantes, c.sincronizado_em
-       ORDER BY c.group_nome ASC`,
+       GROUP BY c.group_jid, c.group_nome, c.participantes, c.is_admin, c.sincronizado_em
+       ORDER BY c.is_admin DESC, c.group_nome ASC`,
       [usuarioId, nomeInstancia]
     );
 
