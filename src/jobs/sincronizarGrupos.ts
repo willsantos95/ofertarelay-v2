@@ -20,85 +20,44 @@ interface Participante {
 interface GrupoEvolution {
   id: string;
   subject: string;
+  owner?: string;           // JID do criador do grupo
   participants?: Participante[];
 }
 
 /**
- * Gera todas as variantes de JID de um telefone para comparação.
- * Cobre os casos de números brasileiros com/sem o dígito 9.
+ * Gera todas as variantes de JID para um telefone.
+ * Cobre números brasileiros com e sem o dígito 9.
  */
 function jidVariants(telefone: string): string[] {
-  // Normalizar: remover tudo que não é dígito e qualquer sufixo @...
   const clean = telefone.replace(/@.*$/, '').replace(/\D/g, '');
   const set = new Set<string>();
 
-  const adicionar = (num: string) => {
+  const add = (num: string) => {
+    if (!num) return;
     set.add(`${num}@s.whatsapp.net`);
-    // Brasil 55 + DDD(2) + 9 + número(8) = 13 dígitos → também sem o 9
+    // Brasil 55 + DDD(2) + 9 + 8 dígitos = 13 → gera versão sem o 9
     if (num.startsWith('55') && num.length === 13) {
-      const semNove = num.slice(0, 4) + num.slice(5); // remove o 9 após o DDD
-      set.add(`${semNove}@s.whatsapp.net`);
+      set.add(`${num.slice(0, 4)}${num.slice(5)}@s.whatsapp.net`);
     }
-    // Brasil 55 + DDD(2) + número(8) = 12 dígitos → também com o 9
+    // Brasil 55 + DDD(2) + 8 dígitos = 12 → gera versão com o 9
     if (num.startsWith('55') && num.length === 12) {
-      const comNove = num.slice(0, 4) + '9' + num.slice(4);
-      set.add(`${comNove}@s.whatsapp.net`);
+      set.add(`${num.slice(0, 4)}9${num.slice(4)}@s.whatsapp.net`);
     }
   };
 
-  adicionar(clean);
+  add(clean);
 
-  // Se não tem o código do país 55, tentar prefixar
-  if (!clean.startsWith('55')) {
-    adicionar('55' + clean);
+  // Se não tem DDI 55, tentar prefixar
+  if (!clean.startsWith('55') && clean.length >= 10) {
+    add('55' + clean);
   }
 
   return [...set];
 }
 
-/** Verifica se o participante é admin (cobre múltiplos formatos da Evolution API) */
-function participanteEAdmin(p: Participante): boolean {
+/** Checa se um participante é admin (cobre múltiplos formatos da API) */
+function eAdmin(p: Participante): boolean {
   return p.admin === 'admin' || p.admin === 'superadmin' || p.admin === true || p.isAdmin === true;
-}
-
-/** Tenta obter o JID do bot via múltiplos endpoints da Evolution API */
-async function getBotJidDaApi(instancia: string): Promise<string | null> {
-  const url = getEvolutionUrl();
-  const key = getEvolutionKey();
-  const headers = { apikey: key };
-  const signal = AbortSignal.timeout(10000);
-
-  // Endpoint 1: connectionState (v1 e v2)
-  try {
-    const resp = await fetch(`${url}/instance/connectionState/${instancia}`, { headers, signal });
-    if (resp.ok) {
-      const data = await resp.json() as Record<string, unknown>;
-      const inst = data?.instance as Record<string, unknown> | undefined;
-      const owner = (
-        inst?.owner ?? inst?.ownerJid ?? inst?.id ??
-        data?.owner ?? data?.ownerJid
-      ) as string | null;
-      if (owner && owner.includes('@')) return owner;
-      if (owner) return `${owner}@s.whatsapp.net`;
-    }
-  } catch { /* ignora */ }
-
-  // Endpoint 2: fetchInstances (v2)
-  try {
-    const resp = await fetch(`${url}/instance/fetchInstances?instanceName=${instancia}`, { headers, signal });
-    if (resp.ok) {
-      const data = await resp.json() as unknown;
-      const list = Array.isArray(data) ? data as Record<string, unknown>[] : [data as Record<string, unknown>];
-      for (const item of list) {
-        const inst = item?.instance as Record<string, unknown> | undefined;
-        const owner = (inst?.owner ?? inst?.ownerJid ?? item?.owner) as string | null;
-        if (owner && owner.includes('@')) return owner;
-        if (owner) return `${owner}@s.whatsapp.net`;
-      }
-    }
-  } catch { /* ignora */ }
-
-  return null;
 }
 
 filaSync.process('sincronizar-grupos', async (job) => {
@@ -110,21 +69,17 @@ filaSync.process('sincronizar-grupos', async (job) => {
   );
 
   try {
-    // Buscar telefone armazenado no banco (fallback para o JID)
+    // Buscar telefone do DB — fonte confiável do número do bot
     const instResult = await pool.query(
       `SELECT telefone FROM whatsapp_instances WHERE usuario_id = $1 AND nome_instancia = $2 LIMIT 1`,
       [usuarioId, instancia]
     );
     const telefoneDb = instResult.rows[0]?.telefone as string | null;
+    const botJids = telefoneDb ? jidVariants(telefoneDb) : [];
 
-    // Tentar obter JID do bot pela API, com fallback para o telefone do DB
-    const jidDaApi = await getBotJidDaApi(instancia);
-    const jidBase = jidDaApi || (telefoneDb ? `${telefoneDb}@s.whatsapp.net` : null);
-    const botJids = jidBase ? jidVariants(jidBase) : [];
+    logger.info({ instancia, telefoneDb, botJids }, 'JIDs do bot para verificação de admin');
 
-    logger.info({ instancia, jidDaApi, jidBase, botJids, telefoneDb }, 'JIDs do bot para verificação de admin');
-
-    // Buscar todos os grupos com participantes
+    // Buscar grupos com participantes (para checar admin nos grupos)
     const resposta = await fetch(
       `${getEvolutionUrl()}/group/fetchAllGroups/${instancia}?getParticipants=true`,
       {
@@ -145,12 +100,20 @@ filaSync.process('sincronizar-grupos', async (job) => {
       const participantes = grupo.participants || [];
       const totalParticipantes = participantes.length;
 
-      // Verificar admin: checa todas as variantes de JID do bot
       let isAdmin = false;
-      if (botJids.length > 0 && participantes.length > 0) {
-        isAdmin = participantes.some(
-          (p) => botJids.includes(p.id) && participanteEAdmin(p)
-        );
+
+      if (botJids.length > 0) {
+        // Caso 1: bot é dono/criador do grupo (owner bate com um JID do bot)
+        if (grupo.owner && botJids.includes(grupo.owner)) {
+          isAdmin = true;
+        }
+
+        // Caso 2: bot está na lista de participantes com cargo de admin
+        if (!isAdmin && participantes.length > 0) {
+          isAdmin = participantes.some(
+            (p) => botJids.includes(p.id) && eAdmin(p)
+          );
+        }
       }
 
       if (isAdmin) adminCount++;
@@ -176,7 +139,7 @@ filaSync.process('sincronizar-grupos', async (job) => {
       [grupos.length, salvos, jobId]
     );
 
-    logger.info({ usuarioId, jobId, salvos, adminCount, botJids }, 'Sincronização concluída');
+    logger.info({ usuarioId, jobId, salvos, adminCount }, 'Sincronização concluída');
   } catch (erro: unknown) {
     logger.error({ erro, jobId }, 'Erro no job de sincronização');
 
