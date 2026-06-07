@@ -13,8 +13,9 @@ export const filaSync = new Bull('whatsapp-sync', {
   redis: getRedisBullConfig(),
 });
 
-const EVOLUTION_URL = process.env.EVOLUTION_API_URL || '';
-const EVOLUTION_KEY = process.env.EVOLUTION_API_KEY || '';
+// Lidos em tempo de execução (não no load do módulo) para suportar testes
+function getEvolutionUrl() { return process.env.EVOLUTION_API_URL || ''; }
+function getEvolutionKey() { return process.env.EVOLUTION_API_KEY || ''; }
 
 // Busca o QR em múltiplos campos possíveis (compatível com v1 e v2)
 function normalizeQrCode(data: Record<string, unknown>): string | null {
@@ -38,18 +39,20 @@ function normalizePairingCode(data: Record<string, unknown>): string | null {
 }
 
 async function evolutionFetch(path: string, options: RequestInit = {}, timeoutMs = 25000): Promise<Record<string, unknown>> {
-  if (!EVOLUTION_URL || !EVOLUTION_KEY) throw new Error('Evolution API não configurada');
+  const url = getEvolutionUrl();
+  const key = getEvolutionKey();
+  if (!url || !key) throw new Error('Evolution API não configurada');
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetch(`${EVOLUTION_URL}${path}`, {
+    const response = await fetch(`${url}${path}`, {
       ...options,
       signal: controller.signal,
       headers: {
         'Content-Type': 'application/json',
-        apikey: EVOLUTION_KEY,
+        apikey: key,
         ...(options.headers as Record<string, string> || {}),
       },
     });

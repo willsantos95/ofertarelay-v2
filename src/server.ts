@@ -7,6 +7,7 @@ import whatsappRoutes from './routes/whatsapp.routes';
 import n8nRoutes from './routes/n8n.routes';
 import settingsRoutes from './routes/settings.routes';
 import relayRoutes from './routes/relay.routes';
+import n8nCompatRoutes from './routes/n8n-compat.routes';
 import { errorHandler } from './middleware/errorHandler';
 
 export function criarApp(): express.Application {
@@ -30,6 +31,8 @@ export function criarApp(): express.Application {
   app.use('/api/v1/n8n', n8nRoutes);
   app.use('/api/v1/settings', settingsRoutes);
   app.use('/api/v1/relay', relayRoutes);
+  // Rotas de compatibilidade com o workflow n8n antigo (mesmo path do backend anterior)
+  app.use('/api/n8n', n8nCompatRoutes);
 
   app.use(errorHandler);
 

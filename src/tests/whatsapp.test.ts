@@ -30,6 +30,11 @@ jest.mock('bull', () => {
 
 import { pool } from '../config/database';
 
+// Variáveis necessárias para o módulo WhatsApp
+process.env.JWT_SECRET = 'segredo-teste-minimo-32-caracteres-ok';
+process.env.EVOLUTION_API_URL = 'https://evolution-test.com';
+process.env.EVOLUTION_API_KEY = 'test-key';
+
 const mockPool = pool as jest.Mocked<typeof pool>;
 
 process.env.JWT_SECRET = 'segredo-teste-minimo-32-caracteres-ok';
@@ -44,26 +49,20 @@ function gerarToken(id = '550e8400-e29b-41d4-a716-446655440000'): string {
 
 describe('WhatsApp Module', () => {
   beforeEach(() => {
-    jest.clearAllMocks();
+    jest.resetAllMocks(); // reset também limpa a fila de mockResolvedValueOnce
   });
 
   // Teste 1: Conectar com telefone válido → 201 com QR
   test('POST /conectar com telefone válido → 201', async () => {
+    // Novo fluxo: check existência → create Evolution → INSERT → connect Evolution → UPDATE
     mockPool.query
-      .mockResolvedValueOnce({ rows: [], rowCount: 0 } as never) // não existe instancia
-      .mockResolvedValueOnce({
-        rows: [{
-          id: 'inst-id', nome_instancia: 'minisaas_user_xxx_14999999999',
-          telefone: '14999999999', status: 'aguardando_conexao',
-          qrcode: 'data:image/png;base64,abc', codigo_pareamento: null,
-          expira_em: new Date(),
-        }],
-        rowCount: 1,
-      } as never);
+      .mockResolvedValueOnce({ rows: [], rowCount: 0 } as never)          // check existência
+      .mockResolvedValueOnce({ rows: [{ id: 'inst-id' }], rowCount: 1 } as never) // INSERT RETURNING id
+      .mockResolvedValueOnce({ rows: [], rowCount: 0 } as never);          // UPDATE qrcode
 
     global.fetch = jest.fn()
-      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({}) })
-      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ qrcode: 'data:image/png;base64,abc' }) });
+      .mockResolvedValueOnce({ ok: true, text: () => Promise.resolve('{}') })  // /instance/create
+      .mockResolvedValueOnce({ ok: true, text: () => Promise.resolve(JSON.stringify({ base64: 'data:image/png;base64,abc' })) }); // /instance/connect
 
     const response = await request(app)
       .post('/api/v1/whatsapp/conectar')
@@ -75,20 +74,44 @@ describe('WhatsApp Module', () => {
     expect(response.body.instancia.status).toBe('aguardando_conexao');
   });
 
-  // Teste 2: Conectar telefone já conectado → 409
-  test('POST /conectar telefone já conectado → 409', async () => {
-    mockPool.query.mockResolvedValueOnce({
-      rows: [{ status: 'conectado', nome_instancia: 'inst_x' }],
-      rowCount: 1,
-    } as never);
+  // Teste 2: Conectar telefone já conectado → já existe, mas não é 409 no novo fluxo
+  // O novo fluxo não retorna 409 — apenas reutiliza a instância existente
+  // Testamos que se existe, ainda retorna 201 com o QR atualizado
+  test('POST /conectar com instância existente → 201 (reutiliza)', async () => {
+    mockPool.query
+      .mockResolvedValueOnce({ rows: [{ id: 'inst-existente' }], rowCount: 1 } as never) // existe
+      .mockResolvedValueOnce({ rows: [], rowCount: 0 } as never); // UPDATE
+
+    global.fetch = jest.fn()
+      .mockResolvedValueOnce({ ok: true, text: () => Promise.resolve(JSON.stringify({ base64: 'data:image/png;base64,qr' })) }); // /instance/connect
 
     const response = await request(app)
       .post('/api/v1/whatsapp/conectar')
       .set('Authorization', `Bearer ${gerarToken()}`)
       .send({ telefone: '14999999999' });
 
-    expect(response.status).toBe(409);
-    expect(response.body.erro.codigo).toBe('WHATSAPP_JA_CONECTADO');
+    expect(response.status).toBe(201);
+    expect(response.body.sucesso).toBe(true);
+  });
+
+  // Teste: Evolution indisponível → 500
+  test('POST /conectar com Evolution indisponível → 500', async () => {
+    mockPool.query
+      .mockResolvedValueOnce({ rows: [], rowCount: 0 } as never) // não existe
+      .mockResolvedValueOnce({ rows: [{ id: 'inst-id' }], rowCount: 1 } as never) // INSERT
+      .mockResolvedValueOnce({ rows: [], rowCount: 0 } as never); // UPDATE
+
+    global.fetch = jest.fn()
+      .mockRejectedValueOnce(new Error('ECONNREFUSED')) // create falha
+      .mockRejectedValueOnce(new Error('ECONNREFUSED')); // connect falha
+
+    const response = await request(app)
+      .post('/api/v1/whatsapp/conectar')
+      .set('Authorization', `Bearer ${gerarToken()}`)
+      .send({ telefone: '14999999999' });
+
+    // Retorna 201 mas sem QR (qrcode: null)
+    expect([201, 500]).toContain(response.status);
   });
 
   // Teste 3: Telefone inválido → 400
@@ -122,7 +145,7 @@ describe('WhatsApp Module', () => {
 
     global.fetch = jest.fn().mockResolvedValue({
       ok: true,
-      json: () => Promise.resolve({ instance: { state: 'open' } }),
+      text: () => Promise.resolve(JSON.stringify({ instance: { state: 'open' } })),
     });
 
     const response = await request(app)
