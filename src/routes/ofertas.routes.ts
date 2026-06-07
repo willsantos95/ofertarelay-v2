@@ -47,9 +47,42 @@ async function getMLCredenciais(usuarioId: string) {
 // SHOPEE
 // ─────────────────────────────────────────────
 
-const LISTAS_SHOPEE = [
-  { query: 'productOfferV2(listType: 0, productCatId: 0, limit: 50)', nome: 'Top Comissão' },
-  { query: 'productOfferV2(listType: 2, limit: 50)',                   nome: 'Flash Sale'   },
+// Fontes de busca da Shopee Affiliate API:
+//  - listType: listas curadas da Shopee (2 = Flash Sale costuma ser a única ativa)
+//  - keyword:  busca por palavra-chave — traz MUITO mais produtos, por categoria
+interface ShopeeArgs {
+  listType?: number;
+  productCatId?: number;
+  keyword?: string;
+  sortType?: number;   // 2 = mais vendidos · 5 = maior comissão
+  page?: number;
+  limit?: number;
+}
+
+interface ShopeeFonte {
+  args: ShopeeArgs;
+  nome: string;
+  paginas: number;
+}
+
+// Cada palavra-chave vira uma "categoria" de ofertas
+const SHOPEE_KEYWORDS = [
+  'eletrônicos', 'casa e cozinha', 'beleza', 'moda feminina', 'moda masculina',
+  'esporte e lazer', 'bebês', 'pet shop', 'ferramentas', 'celular',
+  'fone de ouvido', 'gamer',
+];
+
+const LISTAS_SHOPEE: ShopeeFonte[] = [
+  // Listas curadas por tipo (a Shopee pode retornar vazio em algumas)
+  { args: { listType: 2 },                  nome: 'Flash Sale',    paginas: 2 },
+  { args: { listType: 1 },                  nome: 'Mais Vendidos', paginas: 2 },
+  { args: { listType: 0, productCatId: 0 }, nome: 'Em Alta',       paginas: 2 },
+  // Busca por palavra-chave (fonte principal de variedade)
+  ...SHOPEE_KEYWORDS.map((k): ShopeeFonte => ({
+    args: { keyword: k, sortType: 2 },
+    nome: k.charAt(0).toUpperCase() + k.slice(1),
+    paginas: 1,
+  })),
 ];
 
 const MIN_PRECO    = 20;
@@ -68,10 +101,25 @@ function shopeeSign(appId: string, ts: string, payload: object, secret: string) 
     .digest('hex');
 }
 
-async function buscarListaShopee(queryPart: string, appId: string, secret: string): Promise<ProdutoShopee[]> {
-  const ts      = Math.floor(Date.now() / 1000).toString();
-  const payload = { query: `{ ${queryPart} { nodes { itemId commissionRate commission imageUrl price productLink offerLink productName } } }` };
-  const sig     = shopeeSign(appId, ts, payload, secret);
+/** Monta os argumentos do productOfferV2 a partir de um objeto. */
+function buildShopeeArgs(a: ShopeeArgs): string {
+  const parts: string[] = [];
+  if (a.listType     !== undefined) parts.push(`listType: ${a.listType}`);
+  if (a.productCatId !== undefined) parts.push(`productCatId: ${a.productCatId}`);
+  if (a.keyword)                    parts.push(`keyword: ${JSON.stringify(a.keyword)}`);
+  if (a.sortType     !== undefined) parts.push(`sortType: ${a.sortType}`);
+  if (a.page         !== undefined) parts.push(`page: ${a.page}`);
+  parts.push(`limit: ${a.limit ?? 50}`);
+  return parts.join(', ');
+}
+
+async function buscarListaShopee(
+  args: ShopeeArgs, appId: string, secret: string,
+): Promise<{ nodes: ProdutoShopee[]; hasNextPage: boolean }> {
+  const ts        = Math.floor(Date.now() / 1000).toString();
+  const queryPart = `productOfferV2(${buildShopeeArgs(args)})`;
+  const payload   = { query: `{ ${queryPart} { nodes { itemId commissionRate commission imageUrl price productLink offerLink productName } pageInfo { page limit hasNextPage } } }` };
+  const sig       = shopeeSign(appId, ts, payload, secret);
 
   const resp = await fetch('https://open-api.affiliate.shopee.com.br/graphql', {
     method: 'POST',
@@ -84,9 +132,30 @@ async function buscarListaShopee(queryPart: string, appId: string, secret: strin
   });
 
   if (!resp.ok) throw new Error(`Shopee API ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
-  const data  = await resp.json() as Record<string, unknown>;
-  const nodes = ((data?.data as Record<string, unknown>)?.productOfferV2 as Record<string, unknown>);
-  return (nodes?.nodes as ProdutoShopee[]) || [];
+
+  const data = await resp.json() as Record<string, unknown>;
+
+  // A API pode responder 200 com erros no corpo (ex.: listType/sortType inválido)
+  const gqlErros = data?.errors as Array<{ message?: string }> | undefined;
+  if (gqlErros?.length) throw new Error(gqlErros.map(e => e.message).join('; ').slice(0, 200));
+
+  const block    = (data?.data as Record<string, unknown>)?.productOfferV2 as Record<string, unknown> | undefined;
+  const nodes    = (block?.nodes as ProdutoShopee[]) || [];
+  const pageInfo = block?.pageInfo as { hasNextPage?: boolean } | undefined;
+  return { nodes, hasNextPage: pageInfo?.hasNextPage ?? false };
+}
+
+/** Busca várias páginas de uma mesma fonte, parando quando não há mais resultados. */
+async function buscarPaginado(
+  base: ShopeeArgs, maxPaginas: number, appId: string, secret: string,
+): Promise<ProdutoShopee[]> {
+  const todos: ProdutoShopee[] = [];
+  for (let page = 1; page <= maxPaginas; page++) {
+    const { nodes, hasNextPage } = await buscarListaShopee({ ...base, page }, appId, secret);
+    todos.push(...nodes);
+    if (!hasNextPage || nodes.length === 0) break;
+  }
+  return todos;
 }
 
 // ─────────────────────────────────────────────
@@ -329,38 +398,53 @@ router.post('/sincronizar', autenticacaoRequerida, async (req: RequestComUsuario
   }
 
   try {
-    let totalNovos = 0, totalIgnorados = 0;
+    const porItem  = new Map<string, { p: ProdutoShopee; categoria: string }>();
+    const detalhes: { fonte: string; encontrados: number }[] = [];
     const erros: string[] = [];
 
-    for (const lista of LISTAS_SHOPEE) {
+    // 1. Coleta de todas as fontes (com paginação) + dedupe por itemId
+    for (const fonte of LISTAS_SHOPEE) {
       try {
-        const produtos = await buscarListaShopee(lista.query, creds.appId, creds.appSecret);
+        const produtos = await buscarPaginado(fonte.args, fonte.paginas, creds.appId, creds.appSecret);
         for (const p of produtos) {
-          const preco = parseFloat(String(p.price));
-          const taxa  = parseFloat(String(p.commissionRate));
-          const com   = parseFloat(String(p.commission));
-          if (preco < MIN_PRECO || taxa < MIN_COMISSAO) { totalIgnorados++; continue; }
-
-          const r = await pool.query(
-            `INSERT INTO ofertas
-               (item_id, nome, preco, imagem_url, link_produto, link_afiliado,
-                comissao, taxa_comissao, categoria_nome, plataforma, status)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'shopee','pendente')
-             ON CONFLICT (item_id) DO UPDATE SET
-               preco=EXCLUDED.preco, link_afiliado=EXCLUDED.link_afiliado,
-               taxa_comissao=EXCLUDED.taxa_comissao, atualizado_em=NOW()
-             RETURNING (xmax=0) AS inserido`,
-            [p.itemId, p.productName, preco, p.imageUrl, p.productLink,
-             p.offerLink, isNaN(com) ? null : com, taxa, lista.nome]
-          );
-          if (r.rows[0]?.inserido) totalNovos++; else totalIgnorados++;
+          if (!p?.itemId) continue;
+          const key = String(p.itemId);
+          if (!porItem.has(key)) porItem.set(key, { p, categoria: fonte.nome });
         }
+        detalhes.push({ fonte: fonte.nome, encontrados: produtos.length });
       } catch (err) {
-        erros.push(`${lista.nome}: ${(err as Error).message}`);
+        erros.push(`${fonte.nome}: ${(err as Error).message}`);
       }
     }
 
-    res.json({ sucesso: true, plataforma: 'shopee', totalNovos, totalIgnorados, erros });
+    // 2. Persistência das ofertas únicas
+    let totalNovos = 0, totalIgnorados = 0;
+    for (const { p, categoria } of porItem.values()) {
+      const preco = parseFloat(String(p.price));
+      const taxa  = parseFloat(String(p.commissionRate));
+      const com   = parseFloat(String(p.commission));
+      if (isNaN(preco) || preco < MIN_PRECO || isNaN(taxa) || taxa < MIN_COMISSAO) { totalIgnorados++; continue; }
+
+      const r = await pool.query(
+        `INSERT INTO ofertas
+           (item_id, nome, preco, imagem_url, link_produto, link_afiliado,
+            comissao, taxa_comissao, categoria_nome, plataforma, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'shopee','pendente')
+         ON CONFLICT (item_id) DO UPDATE SET
+           preco=EXCLUDED.preco, link_afiliado=EXCLUDED.link_afiliado,
+           taxa_comissao=EXCLUDED.taxa_comissao, atualizado_em=NOW()
+         RETURNING (xmax=0) AS inserido`,
+        [p.itemId, p.productName, preco, p.imageUrl, p.productLink,
+         p.offerLink, isNaN(com) ? null : com, taxa, categoria]
+      );
+      if (r.rows[0]?.inserido) totalNovos++; else totalIgnorados++;
+    }
+
+    res.json({
+      sucesso: true, plataforma: 'shopee',
+      totalNovos, totalIgnorados, totalUnicos: porItem.size,
+      detalhes, erros,
+    });
   } catch (erro) {
     res.status(500).json({ sucesso: false, erro: { mensagem: (erro as Error).message } });
   }
