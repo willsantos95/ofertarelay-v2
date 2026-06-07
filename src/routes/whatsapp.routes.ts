@@ -179,16 +179,37 @@ router.get('/status', autenticacaoRequerida, async (req: RequestComUsuario, res:
     const instancia = resultado.rows[0];
     let statusAtual = instancia.status as string;
 
-    let ownerJid: string | null = null;
+    let ownerJid: string | null = instancia.owner_jid as string | null;
     try {
       const stateData = await evolutionFetch(`/instance/connectionState/${instancia.nome_instancia}`, { method: 'GET' }, 12000);
       const inst = stateData?.instance as Record<string, unknown> | undefined;
       const state = inst?.state as string || stateData?.state as string || stateData?.connectionStatus as string || statusAtual;
       statusAtual = (state === 'open' || state === 'connected') ? 'conectado' : state;
-      // Salvar owner_jid do bot (retornado pela Evolution API no connectionState)
-      ownerJid = inst?.owner as string || null;
     } catch {
       logger.warn({ instancia: instancia.nome_instancia }, 'Erro ao checar status Evolution, usando DB');
+    }
+
+    // Buscar ownerJid via fetchInstances (retorna @s.whatsapp.net, ao contrário do connectionState que retorna @lid)
+    if (!ownerJid) {
+      try {
+        const url = getEvolutionUrl();
+        const key = getEvolutionKey();
+        const fetchResp = await fetch(
+          `${url}/instance/fetchInstances?instanceName=${instancia.nome_instancia}`,
+          { headers: { 'Content-Type': 'application/json', apikey: key }, signal: AbortSignal.timeout(10000) }
+        );
+        if (fetchResp.ok) {
+          const fetchData = await fetchResp.json() as unknown;
+          const list = Array.isArray(fetchData) ? fetchData as Record<string, unknown>[] : [fetchData as Record<string, unknown>];
+          for (const item of list) {
+            const inst = item?.instance as Record<string, unknown> | undefined;
+            const jid = (inst?.ownerJid ?? inst?.owner ?? item?.ownerJid) as string | null;
+            if (jid && jid.includes('@s.whatsapp.net')) { ownerJid = jid; break; }
+          }
+        }
+      } catch {
+        logger.warn({ instancia: instancia.nome_instancia }, 'Não foi possível obter ownerJid via fetchInstances');
+      }
     }
 
     await pool.query(

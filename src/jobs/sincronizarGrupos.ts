@@ -20,11 +20,11 @@ interface Participante {
 interface GrupoEvolution {
   id: string;
   subject: string;
-  owner?: string;           // JID do criador do grupo (ex: "553198296801@s.whatsapp.net")
+  owner?: string; // @lid format — salvo para auditoria mas NÃO usado para comparação
   participants?: Participante[];
 }
 
-/** Checa se um participante tem cargo de admin (cobre múltiplos formatos da API) */
+/** Verifica se um participante tem cargo de admin (cobre múltiplos formatos da API) */
 function eAdmin(p: Participante): boolean {
   return (
     p.admin === 'admin' ||
@@ -32,6 +32,38 @@ function eAdmin(p: Participante): boolean {
     p.admin === true ||
     p.isAdmin === true
   );
+}
+
+/**
+ * Busca o ownerJid da instância via fetchInstances.
+ * Retorna o JID no formato @s.whatsapp.net (ex: "5514988099530@s.whatsapp.net").
+ */
+async function fetchOwnerJid(instancia: string): Promise<string | null> {
+  try {
+    const resp = await fetch(
+      `${getEvolutionUrl()}/instance/fetchInstances?instanceName=${instancia}`,
+      {
+        headers: { 'Content-Type': 'application/json', apikey: getEvolutionKey() },
+        signal: AbortSignal.timeout(10000),
+      }
+    );
+    if (!resp.ok) return null;
+
+    const data = await resp.json() as unknown;
+    const list = Array.isArray(data)
+      ? (data as Record<string, unknown>[])
+      : [data as Record<string, unknown>];
+
+    for (const item of list) {
+      const inst = item?.instance as Record<string, unknown> | undefined;
+      // A documentação da Evolution v2 retorna ownerJid em @s.whatsapp.net
+      const jid = (inst?.ownerJid ?? inst?.owner ?? item?.ownerJid ?? item?.owner) as string | null;
+      if (jid && jid.includes('@s.whatsapp.net')) return jid;
+    }
+  } catch (err) {
+    logger.warn({ instancia, err: (err as Error).message }, 'Falha ao buscar ownerJid via fetchInstances');
+  }
+  return null;
 }
 
 filaSync.process('sincronizar-grupos', async (job) => {
@@ -43,42 +75,32 @@ filaSync.process('sincronizar-grupos', async (job) => {
   );
 
   try {
-    // Buscar owner_jid da instância no DB (salvo pelo endpoint /status)
+    // 1. Obter ownerJid: primeiro tenta o DB, depois a API
     const instResult = await pool.query(
-      `SELECT owner_jid, telefone FROM whatsapp_instances
-       WHERE usuario_id = $1 AND nome_instancia = $2 LIMIT 1`,
+      `SELECT owner_jid FROM whatsapp_instances WHERE usuario_id = $1 AND nome_instancia = $2 LIMIT 1`,
       [usuarioId, instancia]
     );
-
     let ownerJid: string | null = instResult.rows[0]?.owner_jid as string | null;
 
-    // Se ainda não temos o owner_jid, buscar direto na Evolution API
-    if (!ownerJid) {
-      try {
-        const resp = await fetch(
-          `${getEvolutionUrl()}/instance/connectionState/${instancia}`,
-          { headers: { apikey: getEvolutionKey() }, signal: AbortSignal.timeout(10000) }
+    if (!ownerJid || !ownerJid.includes('@s.whatsapp.net')) {
+      ownerJid = await fetchOwnerJid(instancia);
+      if (ownerJid) {
+        // Persistir para uso futuro
+        await pool.query(
+          `UPDATE whatsapp_instances SET owner_jid = $1 WHERE usuario_id = $2 AND nome_instancia = $3`,
+          [ownerJid, usuarioId, instancia]
         );
-        if (resp.ok) {
-          const data = await resp.json() as Record<string, unknown>;
-          const inst = data?.instance as Record<string, unknown> | undefined;
-          ownerJid = (inst?.owner ?? null) as string | null;
-          // Persistir para uso futuro
-          if (ownerJid) {
-            await pool.query(
-              `UPDATE whatsapp_instances SET owner_jid = $1 WHERE usuario_id = $2 AND nome_instancia = $3`,
-              [ownerJid, usuarioId, instancia]
-            );
-          }
-        }
-      } catch {
-        logger.warn({ instancia }, 'Não foi possível obter owner_jid da Evolution API');
+        logger.info({ instancia, ownerJid }, 'ownerJid obtido da API e salvo no DB');
       }
     }
 
-    logger.info({ instancia, ownerJid }, 'Owner JID da instância para verificação de admin');
+    if (!ownerJid) {
+      logger.warn({ instancia }, 'ownerJid não encontrado — is_admin será false para todos os grupos');
+    } else {
+      logger.info({ instancia, ownerJid }, 'ownerJid pronto para verificação de admin');
+    }
 
-    // Buscar todos os grupos com participantes
+    // 2. Buscar todos os grupos com participantes
     const resposta = await fetch(
       `${getEvolutionUrl()}/group/fetchAllGroups/${instancia}?getParticipants=true`,
       {
@@ -97,22 +119,17 @@ filaSync.process('sincronizar-grupos', async (job) => {
 
     for (const grupo of grupos) {
       const participantes = grupo.participants || [];
+      const totalParticipantes = participantes.length;
+      // group.owner vem em @lid — salvamos para auditoria mas NÃO usamos para comparação
       const groupOwner = grupo.owner || null;
 
       let isAdmin = false;
 
       if (ownerJid) {
-        // Caso 1: o bot é o criador/dono do grupo (owner bate exatamente)
-        if (groupOwner === ownerJid) {
-          isAdmin = true;
-        }
-
-        // Caso 2: o bot está na lista de participantes com cargo de admin
-        if (!isAdmin) {
-          isAdmin = participantes.some(
-            (p) => p.id === ownerJid && eAdmin(p)
-          );
-        }
+        // Comparação pela lista de participantes: ownerJid em @s.whatsapp.net vs participant.id
+        isAdmin = participantes.some(
+          (p) => p.id === ownerJid && eAdmin(p)
+        );
       }
 
       if (isAdmin) adminCount++;
@@ -127,7 +144,7 @@ filaSync.process('sincronizar-grupos', async (job) => {
            group_owner     = $6,
            is_admin        = $7,
            sincronizado_em = NOW()`,
-        [usuarioId, instancia, grupo.id, grupo.subject, participantes.length, groupOwner, isAdmin]
+        [usuarioId, instancia, grupo.id, grupo.subject, totalParticipantes, groupOwner, isAdmin]
       );
       salvos++;
     }
