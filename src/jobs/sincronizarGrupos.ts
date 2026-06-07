@@ -20,44 +20,18 @@ interface Participante {
 interface GrupoEvolution {
   id: string;
   subject: string;
-  owner?: string;           // JID do criador do grupo
+  owner?: string;           // JID do criador do grupo (ex: "553198296801@s.whatsapp.net")
   participants?: Participante[];
 }
 
-/**
- * Gera todas as variantes de JID para um telefone.
- * Cobre números brasileiros com e sem o dígito 9.
- */
-function jidVariants(telefone: string): string[] {
-  const clean = telefone.replace(/@.*$/, '').replace(/\D/g, '');
-  const set = new Set<string>();
-
-  const add = (num: string) => {
-    if (!num) return;
-    set.add(`${num}@s.whatsapp.net`);
-    // Brasil 55 + DDD(2) + 9 + 8 dígitos = 13 → gera versão sem o 9
-    if (num.startsWith('55') && num.length === 13) {
-      set.add(`${num.slice(0, 4)}${num.slice(5)}@s.whatsapp.net`);
-    }
-    // Brasil 55 + DDD(2) + 8 dígitos = 12 → gera versão com o 9
-    if (num.startsWith('55') && num.length === 12) {
-      set.add(`${num.slice(0, 4)}9${num.slice(4)}@s.whatsapp.net`);
-    }
-  };
-
-  add(clean);
-
-  // Se não tem DDI 55, tentar prefixar
-  if (!clean.startsWith('55') && clean.length >= 10) {
-    add('55' + clean);
-  }
-
-  return [...set];
-}
-
-/** Checa se um participante é admin (cobre múltiplos formatos da API) */
+/** Checa se um participante tem cargo de admin (cobre múltiplos formatos da API) */
 function eAdmin(p: Participante): boolean {
-  return p.admin === 'admin' || p.admin === 'superadmin' || p.admin === true || p.isAdmin === true;
+  return (
+    p.admin === 'admin' ||
+    p.admin === 'superadmin' ||
+    p.admin === true ||
+    p.isAdmin === true
+  );
 }
 
 filaSync.process('sincronizar-grupos', async (job) => {
@@ -69,17 +43,42 @@ filaSync.process('sincronizar-grupos', async (job) => {
   );
 
   try {
-    // Buscar telefone do DB — fonte confiável do número do bot
+    // Buscar owner_jid da instância no DB (salvo pelo endpoint /status)
     const instResult = await pool.query(
-      `SELECT telefone FROM whatsapp_instances WHERE usuario_id = $1 AND nome_instancia = $2 LIMIT 1`,
+      `SELECT owner_jid, telefone FROM whatsapp_instances
+       WHERE usuario_id = $1 AND nome_instancia = $2 LIMIT 1`,
       [usuarioId, instancia]
     );
-    const telefoneDb = instResult.rows[0]?.telefone as string | null;
-    const botJids = telefoneDb ? jidVariants(telefoneDb) : [];
 
-    logger.info({ instancia, telefoneDb, botJids }, 'JIDs do bot para verificação de admin');
+    let ownerJid: string | null = instResult.rows[0]?.owner_jid as string | null;
 
-    // Buscar grupos com participantes (para checar admin nos grupos)
+    // Se ainda não temos o owner_jid, buscar direto na Evolution API
+    if (!ownerJid) {
+      try {
+        const resp = await fetch(
+          `${getEvolutionUrl()}/instance/connectionState/${instancia}`,
+          { headers: { apikey: getEvolutionKey() }, signal: AbortSignal.timeout(10000) }
+        );
+        if (resp.ok) {
+          const data = await resp.json() as Record<string, unknown>;
+          const inst = data?.instance as Record<string, unknown> | undefined;
+          ownerJid = (inst?.owner ?? null) as string | null;
+          // Persistir para uso futuro
+          if (ownerJid) {
+            await pool.query(
+              `UPDATE whatsapp_instances SET owner_jid = $1 WHERE usuario_id = $2 AND nome_instancia = $3`,
+              [ownerJid, usuarioId, instancia]
+            );
+          }
+        }
+      } catch {
+        logger.warn({ instancia }, 'Não foi possível obter owner_jid da Evolution API');
+      }
+    }
+
+    logger.info({ instancia, ownerJid }, 'Owner JID da instância para verificação de admin');
+
+    // Buscar todos os grupos com participantes
     const resposta = await fetch(
       `${getEvolutionUrl()}/group/fetchAllGroups/${instancia}?getParticipants=true`,
       {
@@ -98,20 +97,20 @@ filaSync.process('sincronizar-grupos', async (job) => {
 
     for (const grupo of grupos) {
       const participantes = grupo.participants || [];
-      const totalParticipantes = participantes.length;
+      const groupOwner = grupo.owner || null;
 
       let isAdmin = false;
 
-      if (botJids.length > 0) {
-        // Caso 1: bot é dono/criador do grupo (owner bate com um JID do bot)
-        if (grupo.owner && botJids.includes(grupo.owner)) {
+      if (ownerJid) {
+        // Caso 1: o bot é o criador/dono do grupo (owner bate exatamente)
+        if (groupOwner === ownerJid) {
           isAdmin = true;
         }
 
-        // Caso 2: bot está na lista de participantes com cargo de admin
-        if (!isAdmin && participantes.length > 0) {
+        // Caso 2: o bot está na lista de participantes com cargo de admin
+        if (!isAdmin) {
           isAdmin = participantes.some(
-            (p) => botJids.includes(p.id) && eAdmin(p)
+            (p) => p.id === ownerJid && eAdmin(p)
           );
         }
       }
@@ -120,14 +119,15 @@ filaSync.process('sincronizar-grupos', async (job) => {
 
       await pool.query(
         `INSERT INTO whatsapp_group_cache
-           (usuario_id, instancia_nome, group_jid, group_nome, participantes, is_admin)
-         VALUES ($1, $2, $3, $4, $5, $6)
+           (usuario_id, instancia_nome, group_jid, group_nome, participantes, group_owner, is_admin)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (usuario_id, group_jid) DO UPDATE SET
            group_nome      = $4,
            participantes   = $5,
-           is_admin        = $6,
+           group_owner     = $6,
+           is_admin        = $7,
            sincronizado_em = NOW()`,
-        [usuarioId, instancia, grupo.id, grupo.subject, totalParticipantes, isAdmin]
+        [usuarioId, instancia, grupo.id, grupo.subject, participantes.length, groupOwner, isAdmin]
       );
       salvos++;
     }
@@ -139,7 +139,7 @@ filaSync.process('sincronizar-grupos', async (job) => {
       [grupos.length, salvos, jobId]
     );
 
-    logger.info({ usuarioId, jobId, salvos, adminCount }, 'Sincronização concluída');
+    logger.info({ usuarioId, jobId, salvos, adminCount, ownerJid }, 'Sincronização concluída');
   } catch (erro: unknown) {
     logger.error({ erro, jobId }, 'Erro no job de sincronização');
 

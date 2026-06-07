@@ -179,17 +179,23 @@ router.get('/status', autenticacaoRequerida, async (req: RequestComUsuario, res:
     const instancia = resultado.rows[0];
     let statusAtual = instancia.status as string;
 
+    let ownerJid: string | null = null;
     try {
       const stateData = await evolutionFetch(`/instance/connectionState/${instancia.nome_instancia}`, { method: 'GET' }, 12000);
-      const state = (stateData?.instance as Record<string, unknown>)?.state as string || stateData?.state as string || stateData?.connectionStatus as string || statusAtual;
+      const inst = stateData?.instance as Record<string, unknown> | undefined;
+      const state = inst?.state as string || stateData?.state as string || stateData?.connectionStatus as string || statusAtual;
       statusAtual = (state === 'open' || state === 'connected') ? 'conectado' : state;
+      // Salvar owner_jid do bot (retornado pela Evolution API no connectionState)
+      ownerJid = inst?.owner as string || null;
     } catch {
       logger.warn({ instancia: instancia.nome_instancia }, 'Erro ao checar status Evolution, usando DB');
     }
 
     await pool.query(
-      `UPDATE whatsapp_instances SET status = $1, atualizado_em = NOW() WHERE id = $2`,
-      [statusAtual, instancia.id]
+      `UPDATE whatsapp_instances
+       SET status = $1, owner_jid = COALESCE($2, owner_jid), atualizado_em = NOW()
+       WHERE id = $3`,
+      [statusAtual, ownerJid, instancia.id]
     );
 
     res.json({
