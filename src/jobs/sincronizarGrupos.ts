@@ -13,6 +13,7 @@ interface JobData {
 
 interface Participante {
   id: string;
+  phoneNumber?: string;     // @s.whatsapp.net — campo correto para comparar com ownerJid
   admin: 'admin' | 'superadmin' | null | boolean;
   isAdmin?: boolean;
 }
@@ -149,7 +150,7 @@ filaSync.process('sincronizar-grupos', async (job) => {
           groupSubject: grupo.subject,
           groupOwner,
           participantesTotal: participantes.length,
-          amostraParticipantes: participantes.slice(0, 3).map(p => ({ id: p.id, admin: p.admin })),
+          amostraParticipantes: participantes.slice(0, 3).map(p => ({ id: p.id, phoneNumber: p.phoneNumber, admin: p.admin })),
           ownerJid,
           ownerLid,
         }, '[SYNC] Amostra de participantes');
@@ -157,10 +158,12 @@ filaSync.process('sincronizar-grupos', async (job) => {
 
       let isAdmin = false;
 
-      if (participantes.length > 0 && (ownerJid || ownerLid)) {
+      if (participantes.length > 0 && ownerJid) {
         isAdmin = participantes.some((p) => {
-          const match = (ownerJid && p.id === ownerJid) || (ownerLid && p.id === ownerLid);
-          return match && eAdmin(p);
+          // Comparar pelo phoneNumber (@s.whatsapp.net), que é o campo correto
+          // O campo id retorna @lid (identificador interno do WhatsApp)
+          const phone = p.phoneNumber || '';
+          return phone === ownerJid && eAdmin(p);
         });
       }
 
