@@ -668,6 +668,105 @@ router.post('/:id/enviar-whatsapp', autenticacaoRequerida, async (req: RequestCo
   }
 });
 
+// POST /api/v1/ofertas/:id/enviar-telegram
+router.post('/:id/enviar-telegram', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
+  const { id }    = req.params;
+  const { legenda, chatIds } = req.body as { legenda: string; chatIds?: string[] };
+  const usuarioId = req.usuario!.id;
+
+  try {
+    // Buscar configurações reais do Telegram (sem mascaramento)
+    const tgResult = await pool.query(
+      `SELECT payload FROM user_settings WHERE usuario_id = $1 AND tipo = 'telegram'`,
+      [usuarioId]
+    );
+    if (!tgResult.rows.length) {
+      res.status(400).json({ sucesso: false, erro: { mensagem: 'Telegram não configurado.' } });
+      return;
+    }
+
+    const tg = tgResult.rows[0].payload as { botToken: string; chatIds: string[]; status: string };
+    if (tg.status !== 'active') {
+      res.status(400).json({ sucesso: false, erro: { mensagem: 'Telegram não está ativo.' } });
+      return;
+    }
+    if (!tg.botToken) {
+      res.status(400).json({ sucesso: false, erro: { mensagem: 'Bot Token do Telegram não configurado.' } });
+      return;
+    }
+
+    const destinos: string[] = chatIds?.length ? chatIds : (tg.chatIds || []);
+    if (!destinos.length) {
+      res.status(400).json({ sucesso: false, erro: { mensagem: 'Nenhum Chat ID configurado no Telegram.' } });
+      return;
+    }
+
+    // Buscar oferta
+    const ofertaResult = await pool.query('SELECT imagem_url FROM ofertas WHERE id = $1', [id]);
+    if (!ofertaResult.rows.length) {
+      res.status(404).json({ sucesso: false, erro: { mensagem: 'Oferta não encontrada.' } });
+      return;
+    }
+    const oferta = ofertaResult.rows[0] as { imagem_url: string | null };
+
+    const enviados: string[] = [];
+    const erros:    string[] = [];
+
+    for (const chatId of destinos) {
+      try {
+        let endpoint: string;
+        let body: Record<string, unknown>;
+
+        if (oferta.imagem_url) {
+          endpoint = `https://api.telegram.org/bot${tg.botToken}/sendPhoto`;
+          body = {
+            chat_id:    chatId,
+            photo:      oferta.imagem_url,
+            caption:    legenda,
+            parse_mode: 'Markdown',
+          };
+        } else {
+          endpoint = `https://api.telegram.org/bot${tg.botToken}/sendMessage`;
+          body = {
+            chat_id:    chatId,
+            text:       legenda,
+            parse_mode: 'Markdown',
+          };
+        }
+
+        const resp = await fetch(endpoint, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify(body),
+          signal:  AbortSignal.timeout(15000),
+        });
+
+        const data = await resp.json() as { ok: boolean; description?: string };
+        if (data.ok) {
+          enviados.push(chatId);
+        } else {
+          erros.push(`${chatId}: ${data.description || 'Erro desconhecido'}`);
+        }
+      } catch (err) {
+        erros.push(`${chatId}: ${(err as Error).message}`);
+      }
+    }
+
+    if (enviados.length > 0) {
+      await pool.query(
+        `UPDATE ofertas SET status = 'enviado', atualizado_em = NOW() WHERE id = $1`,
+        [id]
+      );
+    }
+
+    logger.info({ id, enviados: enviados.length, erros }, 'Oferta enviada ao Telegram');
+    res.json({ sucesso: true, enviados: enviados.length, erros });
+  } catch (erro) {
+    logger.error({ erro }, 'Erro ao enviar oferta para Telegram');
+    res.status(500).json({ sucesso: false, erro: { mensagem: (erro as Error).message } });
+  }
+});
+
 // PATCH /api/v1/ofertas/:id/status
 router.patch('/:id/status', autenticacaoRequerida, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
