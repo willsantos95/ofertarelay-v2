@@ -1,14 +1,25 @@
 import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
 import { pool } from '../config/database';
-import { autenticacaoRequerida } from '../middleware/authRequired';
+import { autenticacaoRequerida, RequestComUsuario } from '../middleware/authRequired';
 import { logger } from '../utils/logger';
 
 const router = Router();
 
-// Credenciais Shopee Affiliate (env vars)
-function getShopeeAppId()  { return process.env.SHOPEE_APP_ID  || ''; }
-function getShopeeSecret() { return process.env.SHOPEE_SECRET  || ''; }
+/** Busca as credenciais Shopee do usuário na tabela user_settings (sem mascaramento) */
+async function getShopeeCredenciais(usuarioId: string): Promise<{ appId: string; appSecret: string } | null> {
+  const result = await pool.query(
+    `SELECT payload FROM user_settings WHERE usuario_id = $1 AND tipo = 'affiliate'`,
+    [usuarioId]
+  );
+  if (result.rows.length === 0) return null;
+
+  const payload = result.rows[0].payload as Record<string, unknown>;
+  const shopee  = payload?.shopee as Record<string, string> | undefined;
+
+  if (!shopee?.appId || !shopee?.appSecret) return null;
+  return { appId: shopee.appId, appSecret: shopee.appSecret };
+}
 
 // Categorias a sincronizar (mesmas do workflow n8n de referência)
 const CATEGORIAS = [
@@ -49,9 +60,7 @@ function shopeeSign(appId: string, timestamp: string, payload: object, secret: s
 /**
  * Busca ofertas de uma categoria na API Shopee Affiliate.
  */
-async function buscarCategoria(categoriaId: number): Promise<ProdutoShopee[]> {
-  const appId     = getShopeeAppId();
-  const secret    = getShopeeSecret();
+async function buscarCategoria(categoriaId: number, appId: string, secret: string): Promise<ProdutoShopee[]> {
   const timestamp = Math.floor(Date.now() / 1000).toString();
 
   const payload = {
@@ -83,24 +92,27 @@ async function buscarCategoria(categoriaId: number): Promise<ProdutoShopee[]> {
 }
 
 // POST /api/v1/ofertas/sincronizar
-// Busca ofertas em todas as categorias e salva no banco de dados
-router.post('/sincronizar', autenticacaoRequerida, async (_req: Request, res: Response): Promise<void> => {
-  if (!getShopeeAppId() || !getShopeeSecret()) {
-    res.status(500).json({
+// Busca ofertas em todas as categorias usando as credenciais Shopee do usuário logado
+router.post('/sincronizar', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
+  const usuarioId = req.usuario!.id;
+
+  const creds = await getShopeeCredenciais(usuarioId);
+  if (!creds) {
+    res.status(400).json({
       sucesso: false,
-      erro: { mensagem: 'Configure SHOPEE_APP_ID e SHOPEE_SECRET nas variáveis de ambiente.' },
+      erro: { mensagem: 'Configure seu App ID e App Secret da Shopee na página Afiliado antes de sincronizar.' },
     });
     return;
   }
 
   try {
-    let totalNovos   = 0;
+    let totalNovos     = 0;
     let totalIgnorados = 0;
     const errosCat: string[] = [];
 
     for (const cat of CATEGORIAS) {
       try {
-        const produtos = await buscarCategoria(cat.id);
+        const produtos = await buscarCategoria(cat.id, creds.appId, creds.appSecret);
 
         for (const p of produtos) {
           const preco         = parseFloat(String(p.price));
