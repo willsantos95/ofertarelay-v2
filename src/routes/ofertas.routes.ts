@@ -421,6 +421,110 @@ router.get('/categorias', autenticacaoRequerida, async (_req: Request, res: Resp
   }
 });
 
+// POST /api/v1/ofertas/:id/enviar-whatsapp
+router.post('/:id/enviar-whatsapp', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
+  const { id }    = req.params;
+  const { legenda, grupos } = req.body as { legenda: string; grupos?: string[] };
+  const usuarioId = req.usuario!.id;
+
+  try {
+    // Buscar oferta
+    const ofertaResult = await pool.query('SELECT * FROM ofertas WHERE id = $1', [id]);
+    if (!ofertaResult.rows.length) {
+      res.status(404).json({ sucesso: false, erro: { mensagem: 'Oferta não encontrada.' } });
+      return;
+    }
+    const oferta = ofertaResult.rows[0] as { imagem_url: string | null };
+
+    // Buscar instância WhatsApp conectada
+    const instResult = await pool.query(
+      `SELECT nome_instancia FROM whatsapp_instances
+       WHERE usuario_id = $1 AND status = 'conectado'
+       ORDER BY criado_em DESC LIMIT 1`,
+      [usuarioId]
+    );
+    if (!instResult.rows.length) {
+      res.status(400).json({ sucesso: false, erro: { mensagem: 'WhatsApp não está conectado.' } });
+      return;
+    }
+    const nomeInstancia = instResult.rows[0].nome_instancia as string;
+
+    // Grupos de destino: usa os fornecidos ou busca os configurados
+    let gruposDestino: string[] = grupos || [];
+    if (!gruposDestino.length) {
+      const gr = await pool.query(
+        `SELECT group_jid FROM usuario_whatsapp_grupos
+         WHERE usuario_id = $1 AND papel = 'destino' AND deletado_em IS NULL`,
+        [usuarioId]
+      );
+      gruposDestino = gr.rows.map((r: { group_jid: string }) => r.group_jid);
+    }
+
+    if (!gruposDestino.length) {
+      res.status(400).json({ sucesso: false, erro: { mensagem: 'Nenhum grupo de destino configurado. Configure na página Grupos.' } });
+      return;
+    }
+
+    const evoUrl = process.env.EVOLUTION_API_URL || '';
+    const evoKey = process.env.EVOLUTION_API_KEY || '';
+    const enviados: string[] = [];
+    const erros:    string[] = [];
+
+    for (const groupJid of gruposDestino) {
+      try {
+        let endpoint: string;
+        let body: Record<string, unknown>;
+
+        if (oferta.imagem_url) {
+          // Enviar imagem com legenda
+          endpoint = `/message/sendMedia/${nomeInstancia}`;
+          body = {
+            number:    groupJid,
+            mediatype: 'image',
+            media:     oferta.imagem_url,
+            mimetype:  'image/jpeg',
+            caption:   legenda,
+          };
+        } else {
+          // Sem imagem — enviar só texto
+          endpoint = `/message/sendText/${nomeInstancia}`;
+          body = { number: groupJid, text: legenda };
+        }
+
+        const resp = await fetch(`${evoUrl}${endpoint}`, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json', apikey: evoKey },
+          body:    JSON.stringify(body),
+          signal:  AbortSignal.timeout(15000),
+        });
+
+        if (resp.ok) {
+          enviados.push(groupJid);
+        } else {
+          const txt = await resp.text();
+          erros.push(`${groupJid}: ${txt.slice(0, 120)}`);
+        }
+      } catch (err) {
+        erros.push(`${groupJid}: ${(err as Error).message}`);
+      }
+    }
+
+    // Marcar como enviado se pelo menos um grupo recebeu
+    if (enviados.length > 0) {
+      await pool.query(
+        `UPDATE ofertas SET status = 'enviado', atualizado_em = NOW() WHERE id = $1`,
+        [id]
+      );
+    }
+
+    logger.info({ id, enviados: enviados.length, erros }, 'Oferta enviada ao WhatsApp');
+    res.json({ sucesso: true, enviados: enviados.length, erros });
+  } catch (erro) {
+    logger.error({ erro }, 'Erro ao enviar oferta para WhatsApp');
+    res.status(500).json({ sucesso: false, erro: { mensagem: (erro as Error).message } });
+  }
+});
+
 // PATCH /api/v1/ofertas/:id/status
 router.patch('/:id/status', autenticacaoRequerida, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
