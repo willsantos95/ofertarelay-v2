@@ -234,4 +234,14 @@ router.get('/me', autenticacaoRequerida, async (req: RequestComUsuario, res: Res
   }
 });
 
+// POST /api/v1/auth/sair  — limpa o cookie de autenticação
+router.post('/sair', (_req: Request, res: Response): void => {
+  res.clearCookie('auth_token', {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'strict',
+  });
+  res.json({ sucesso: true });
+});
+
 export default router;

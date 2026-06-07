@@ -573,6 +573,26 @@ router.get('/categorias', autenticacaoRequerida, async (_req: Request, res: Resp
   }
 });
 
+// DELETE /api/v1/ofertas  — limpa ofertas (todas ou filtradas por plataforma/status)
+router.delete('/', autenticacaoRequerida, async (req: Request, res: Response): Promise<void> => {
+  const { plataforma, status } = req.query as Record<string, string>;
+  const filtros: string[] = [];
+  const params: unknown[] = [];
+  let idx = 1;
+
+  if (plataforma) { filtros.push(`plataforma = $${idx++}`); params.push(plataforma); }
+  if (status)     { filtros.push(`status = $${idx++}`);     params.push(status); }
+
+  const where = filtros.length ? `WHERE ${filtros.join(' AND ')}` : '';
+
+  try {
+    const r = await pool.query(`DELETE FROM ofertas ${where}`, params);
+    res.json({ sucesso: true, removidas: r.rowCount ?? 0 });
+  } catch (erro) {
+    res.status(500).json({ sucesso: false, erro: { mensagem: (erro as Error).message } });
+  }
+});
+
 // POST /api/v1/ofertas/:id/gerar-link-afiliado
 // Gera (ou renova) o link de afiliado ML com refresh de cookies
 router.post('/:id/gerar-link-afiliado', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
