@@ -12,14 +12,20 @@ const router = Router();
 // ─────────────────────────────────────────────
 
 async function getShopeeCredenciais(usuarioId: string) {
+  // 1. Tenta credenciais do usuário (página Afiliado)
   const r = await pool.query(
     `SELECT payload FROM user_settings WHERE usuario_id = $1 AND tipo = 'affiliate'`,
     [usuarioId]
   );
-  if (!r.rows.length) return null;
-  const shopee = (r.rows[0].payload as Record<string, Record<string, string>>)?.shopee;
-  if (!shopee?.appId || !shopee?.appSecret) return null;
-  return { appId: shopee.appId, appSecret: shopee.appSecret };
+  const shopee = r.rows.length
+    ? (r.rows[0].payload as Record<string, Record<string, string>>)?.shopee
+    : null;
+
+  const appId     = shopee?.appId     || process.env.SHOPEE_APP_ID  || '';
+  const appSecret = shopee?.appSecret || process.env.SHOPEE_SECRET  || '';
+
+  if (!appId || !appSecret) return null;
+  return { appId, appSecret };
 }
 
 async function getMLCredenciais(usuarioId: string) {
