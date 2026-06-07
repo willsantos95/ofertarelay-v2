@@ -205,45 +205,114 @@ async function scrapeMLPage(url: string, cookies = ''): Promise<MLProduto[]> {
   return produtos;
 }
 
-/** Gera link de afiliado do ML via API do programa de afiliados */
+const ML_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Edg/144.0.0.0';
+
+/**
+ * Mescla cookies antigos com os novos set-cookie da resposta.
+ * Igual ao "merge cookies" do workflow n8n de referência.
+ */
+function mergeCookies(oldCookies: string, setCookieHeaders: string[]): string {
+  const map: Record<string, string> = {};
+
+  // Parsear cookies existentes
+  oldCookies.split(';').forEach((c) => {
+    const idx = c.trim().indexOf('=');
+    if (idx > 0) {
+      map[c.trim().slice(0, idx).trim()] = c.trim().slice(idx + 1).trim();
+    }
+  });
+
+  // Sobrescrever com os novos set-cookie (apenas a parte nome=valor, ignorar path/expires/etc.)
+  setCookieHeaders.forEach((header) => {
+    const part = header.split(';')[0].trim();
+    const idx  = part.indexOf('=');
+    if (idx > 0) {
+      map[part.slice(0, idx).trim()] = part.slice(idx + 1).trim();
+    }
+  });
+
+  return Object.entries(map).map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+/**
+ * Gera link de afiliado ML com refresh de cookies:
+ * 1. GET /afiliados/linkbuilder → renova cookies via set-cookie headers
+ * 2. Mescla cookies antigos + novos
+ * 3. POST /affiliate-program/api/v2/affiliates/createLink
+ * Retorna o short_url (ex: https://meli.la/1C8Lv8i) ou null se falhar.
+ */
 async function gerarLinkAfiliadoML(
-  url: string,
+  produtoUrl: string,
   tag: string,
   cookies: string,
-): Promise<string | null> {
-  if (!cookies || !tag) return null;
+): Promise<{ shortUrl: string | null; cookiesAtualizados: string }> {
+  if (!cookies || !tag) return { shortUrl: null, cookiesAtualizados: cookies };
 
+  let cookiesAtualizados = cookies;
+
+  // Passo 1: Renovar cookies acessando a página do linkbuilder (igual ao n8n)
+  try {
+    const refreshResp = await fetch('https://www.mercadolivre.com.br/afiliados/linkbuilder', {
+      headers: {
+        'User-Agent': ML_UA,
+        'accept':     'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'cookie':     cookies,
+      },
+      signal: AbortSignal.timeout(15000),
+      redirect: 'follow',
+    });
+
+    // Extrair set-cookie da resposta
+    // Node 18.14+ tem getSetCookie(); fallback para get('set-cookie')
+    const raw = (refreshResp.headers as unknown as { getSetCookie?: () => string[] }).getSetCookie?.()
+      ?? [refreshResp.headers.get('set-cookie') ?? ''].filter(Boolean);
+
+    if (raw.length > 0) {
+      cookiesAtualizados = mergeCookies(cookies, raw);
+      logger.info({ tag }, 'ML cookies renovados com sucesso');
+    }
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, 'ML: falha ao renovar cookies, usando os originais');
+  }
+
+  // Passo 2: Gerar link de afiliado com os cookies atualizados
   try {
     const resp = await fetch(
       'https://www.mercadolivre.com.br/affiliate-program/api/v2/affiliates/createLink',
       {
         method: 'POST',
         headers: {
-          'Content-Type':    'application/json',
-          'accept':          'application/json, text/plain, */*',
-          'accept-language': 'pt-BR,pt;q=0.9',
-          'origin':          'https://www.mercadolivre.com.br',
-          'referer':         'https://www.mercadolivre.com.br/afiliados/linkbuilder',
-          'user-agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'cookie':          cookies,
-          'sec-fetch-dest':  'empty',
-          'sec-fetch-mode':  'cors',
-          'sec-fetch-site':  'same-origin',
+          'Content-Type':       'application/json',
+          'accept':             'application/json, text/plain, */*',
+          'accept-language':    'en-US,en;q=0.9',
+          'origin':             'https://www.mercadolivre.com.br',
+          'referer':            'https://www.mercadolivre.com.br/afiliados/linkbuilder',
+          'user-agent':         ML_UA,
+          'sec-ch-ua':          '"Not(A:Brand";v="8", "Chromium";v="144"',
+          'sec-ch-ua-mobile':   '?0',
+          'sec-ch-ua-platform': '"macOS"',
+          'sec-fetch-dest':     'empty',
+          'sec-fetch-mode':     'cors',
+          'sec-fetch-site':     'same-origin',
+          'cookie':             cookiesAtualizados,
         },
-        body: JSON.stringify({ urls: [url], tag }),
-        signal: AbortSignal.timeout(10000),
+        body: JSON.stringify({ urls: [produtoUrl], tag }),
+        signal: AbortSignal.timeout(15000),
       }
     );
 
     if (!resp.ok) {
-      logger.warn({ status: resp.status, url }, 'ML affiliate link falhou');
-      return null;
+      logger.warn({ status: resp.status, produtoUrl }, 'ML createLink falhou');
+      return { shortUrl: null, cookiesAtualizados };
     }
+
     const data = await resp.json() as { urls?: { short_url?: string }[] };
-    return data?.urls?.[0]?.short_url || null;
+    const shortUrl = data?.urls?.[0]?.short_url || null;
+    logger.info({ shortUrl, produtoUrl }, 'ML link de afiliado gerado');
+    return { shortUrl, cookiesAtualizados };
   } catch (err) {
     logger.warn({ err: (err as Error).message }, 'Erro ao gerar link afiliado ML');
-    return null;
+    return { shortUrl: null, cookiesAtualizados };
   }
 }
 
@@ -329,8 +398,8 @@ router.post('/sincronizar/mercadolivre', autenticacaoRequerida, async (req: Requ
           if (!precoFinal || precoFinal < MIN_PRECO) { totalIgnorados++; continue; }
 
           // Gerar link de afiliado (fallback para link original se cookies expiraram)
-          let linkAfiliado = await gerarLinkAfiliadoML(p.linkCompra, creds.tag, creds.cookies);
-          if (!linkAfiliado) linkAfiliado = p.linkCompra;
+          const { shortUrl } = await gerarLinkAfiliadoML(p.linkCompra, creds.tag, creds.cookies);
+          const linkAfiliado = shortUrl || p.linkCompra;
 
           const r = await pool.query(
             `INSERT INTO ofertas
@@ -417,6 +486,80 @@ router.get('/categorias', autenticacaoRequerida, async (_req: Request, res: Resp
     );
     res.json({ sucesso: true, categorias: result.rows });
   } catch (erro) {
+    res.status(500).json({ sucesso: false, erro: { mensagem: (erro as Error).message } });
+  }
+});
+
+// POST /api/v1/ofertas/:id/gerar-link-afiliado
+// Gera (ou renova) o link de afiliado ML com refresh de cookies
+router.post('/:id/gerar-link-afiliado', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
+  const { id }    = req.params;
+  const usuarioId = req.usuario!.id;
+
+  try {
+    const ofertaResult = await pool.query(
+      `SELECT id, plataforma, link_produto, link_afiliado FROM ofertas WHERE id = $1`,
+      [id]
+    );
+    if (!ofertaResult.rows.length) {
+      res.status(404).json({ sucesso: false, erro: { mensagem: 'Oferta não encontrada.' } });
+      return;
+    }
+    const oferta = ofertaResult.rows[0] as {
+      id: string; plataforma: string;
+      link_produto: string | null; link_afiliado: string | null;
+    };
+
+    // Shopee já tem link de afiliado direto — retorna como está
+    if (oferta.plataforma !== 'mercadolivre') {
+      res.json({ sucesso: true, linkAfiliado: oferta.link_afiliado });
+      return;
+    }
+
+    const creds = await getMLCredenciais(usuarioId);
+    if (!creds) {
+      res.status(400).json({ sucesso: false, erro: { mensagem: 'Configure Tag e Cookies do ML na página Afiliado.' } });
+      return;
+    }
+
+    const urlProduto = oferta.link_produto || oferta.link_afiliado || '';
+    if (!urlProduto) {
+      res.status(400).json({ sucesso: false, erro: { mensagem: 'Oferta sem URL de produto.' } });
+      return;
+    }
+
+    const { shortUrl, cookiesAtualizados } = await gerarLinkAfiliadoML(urlProduto, creds.tag, creds.cookies);
+
+    if (shortUrl) {
+      // Persistir o link de afiliado gerado
+      await pool.query(
+        `UPDATE ofertas SET link_afiliado = $1, atualizado_em = NOW() WHERE id = $2`,
+        [shortUrl, id]
+      );
+
+      // Persistir os cookies renovados para a próxima chamada
+      if (cookiesAtualizados !== creds.cookies) {
+        const settingsResult = await pool.query(
+          `SELECT payload FROM user_settings WHERE usuario_id = $1 AND tipo = 'affiliate'`,
+          [usuarioId]
+        );
+        if (settingsResult.rows.length) {
+          const payload = settingsResult.rows[0].payload as Record<string, unknown>;
+          const ml = (payload.mercadoLivre || {}) as Record<string, string>;
+          await pool.query(
+            `UPDATE user_settings SET payload = $1, atualizado_em = NOW()
+             WHERE usuario_id = $2 AND tipo = 'affiliate'`,
+            [JSON.stringify({ ...payload, mercadoLivre: { ...ml, cookies: cookiesAtualizados } }), usuarioId]
+          );
+        }
+      }
+
+      res.json({ sucesso: true, linkAfiliado: shortUrl });
+    } else {
+      res.json({ sucesso: false, linkAfiliado: oferta.link_afiliado, erro: { mensagem: 'Não foi possível gerar o link. Verifique os cookies do ML.' } });
+    }
+  } catch (erro) {
+    logger.error({ erro }, 'Erro ao gerar link afiliado ML');
     res.status(500).json({ sucesso: false, erro: { mensagem: (erro as Error).message } });
   }
 });
