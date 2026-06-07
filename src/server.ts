@@ -27,6 +27,7 @@ export function criarApp(): express.Application {
 
   app.use('/api/v1/auth', authRoutes);
   app.use('/api/v1/faturamento', billingRoutes);
+  app.use('/api/v1/billing', billingRoutes);      // alias em inglês para o frontend
   app.use('/api/v1/whatsapp', whatsappRoutes);
   app.use('/api/v1/n8n', n8nRoutes);
   app.use('/api/v1/settings', settingsRoutes);
