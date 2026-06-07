@@ -189,8 +189,11 @@ router.get('/status', autenticacaoRequerida, async (req: RequestComUsuario, res:
       logger.warn({ instancia: instancia.nome_instancia }, 'Erro ao checar status Evolution, usando DB');
     }
 
-    // Buscar ownerJid via fetchInstances (retorna @s.whatsapp.net, ao contrário do connectionState que retorna @lid)
-    if (!ownerJid) {
+    // Buscar ownerJid e ownerLid via fetchInstances
+    // ownerJid = @s.whatsapp.net (para comparar com participantes nesse formato)
+    // ownerLid = @lid            (para comparar com participantes nesse formato)
+    let ownerLid: string | null = instancia.owner_lid as string | null;
+    if (!ownerJid || !ownerLid) {
       try {
         const url = getEvolutionUrl();
         const key = getEvolutionKey();
@@ -203,20 +206,26 @@ router.get('/status', autenticacaoRequerida, async (req: RequestComUsuario, res:
           const list = Array.isArray(fetchData) ? fetchData as Record<string, unknown>[] : [fetchData as Record<string, unknown>];
           for (const item of list) {
             const inst = item?.instance as Record<string, unknown> | undefined;
-            const jid = (inst?.ownerJid ?? inst?.owner ?? item?.ownerJid) as string | null;
-            if (jid && jid.includes('@s.whatsapp.net')) { ownerJid = jid; break; }
+            const jidField  = (inst?.ownerJid ?? item?.ownerJid) as string | null;
+            const ownerField = (inst?.owner ?? item?.owner) as string | null;
+            if (jidField?.includes('@s.whatsapp.net') && !ownerJid)  ownerJid = jidField;
+            if (ownerField?.includes('@s.whatsapp.net') && !ownerJid) ownerJid = ownerField;
+            if (ownerField?.includes('@lid') && !ownerLid) ownerLid = ownerField;
           }
         }
       } catch {
-        logger.warn({ instancia: instancia.nome_instancia }, 'Não foi possível obter ownerJid via fetchInstances');
+        logger.warn({ instancia: instancia.nome_instancia }, 'Não foi possível obter owner info via fetchInstances');
       }
     }
 
     await pool.query(
       `UPDATE whatsapp_instances
-       SET status = $1, owner_jid = COALESCE($2, owner_jid), atualizado_em = NOW()
-       WHERE id = $3`,
-      [statusAtual, ownerJid, instancia.id]
+       SET status    = $1,
+           owner_jid = COALESCE($2, owner_jid),
+           owner_lid = COALESCE($3, owner_lid),
+           atualizado_em = NOW()
+       WHERE id = $4`,
+      [statusAtual, ownerJid, ownerLid, instancia.id]
     );
 
     res.json({
