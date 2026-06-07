@@ -383,7 +383,11 @@ router.get('/dashboard', autenticacaoRequerida, async (req: RequestComUsuario, r
       pool.query(`SELECT nome_instancia AS instance_name, telefone AS phone, status FROM whatsapp_instances WHERE usuario_id = $1 ORDER BY criado_em DESC LIMIT 1`, [usuarioId]),
       pool.query(`SELECT id, nome AS group_name, group_jid, nicho AS niche, papel AS role FROM usuario_whatsapp_grupos WHERE usuario_id = $1 AND deletado_em IS NULL ORDER BY papel, nome`, [usuarioId]),
     ]);
-    const instance = instanciaResult.rows.length > 0 ? instanciaResult.rows[0] : null;
+    // Normalizar status para inglês (Evolution usa 'open'/'connected', DB pode ter 'conectado')
+    const normalizarStatus = (s: string) => (s === 'conectado' ? 'open' : s);
+    const instance = instanciaResult.rows.length > 0
+      ? { ...instanciaResult.rows[0], status: normalizarStatus(instanciaResult.rows[0].status as string) }
+      : null;
     const todosGrupos = gruposResult.rows as { id: string; group_name: string; group_jid: string; niche: string; role: string }[];
     const originGroups = todosGrupos.filter((g) => g.role === 'origem').map((g) => ({ ...g, status: 'active' }));
     const destinationGroups = todosGrupos.filter((g) => g.role === 'destino').map((g) => ({ ...g, status: 'active' }));
