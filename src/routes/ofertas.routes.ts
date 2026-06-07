@@ -74,9 +74,8 @@ const SHOPEE_KEYWORDS = [
 
 const LISTAS_SHOPEE: ShopeeFonte[] = [
   // Listas curadas por tipo (a Shopee pode retornar vazio em algumas)
-  { args: { listType: 2 },                  nome: 'Flash Sale',    paginas: 2 },
-  { args: { listType: 1 },                  nome: 'Mais Vendidos', paginas: 2 },
-  { args: { listType: 0, productCatId: 0 }, nome: 'Em Alta',       paginas: 2 },
+  { args: { listType: 2 }, nome: 'Flash Sale',    paginas: 2 },
+  { args: { listType: 1 }, nome: 'Mais Vendidos', paginas: 2 },
   // Busca por palavra-chave (fonte principal de variedade)
   ...SHOPEE_KEYWORDS.map((k): ShopeeFonte => ({
     args: { keyword: k, sortType: 2 },
@@ -524,7 +523,7 @@ router.get('/', autenticacaoRequerida, async (req: Request, res: Response): Prom
   const params: unknown[] = [];
   let idx = 1;
 
-  if (categoria)  { filtros.push(`categoria_id = $${idx++}`);   params.push(parseInt(categoria)); }
+  if (categoria)  { filtros.push(`categoria_nome = $${idx++}`); params.push(categoria); }
   if (status)     { filtros.push(`status = $${idx++}`);         params.push(status); }
   if (plataforma) { filtros.push(`plataforma = $${idx++}`);     params.push(plataforma); }
 
