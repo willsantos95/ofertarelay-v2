@@ -8,6 +8,7 @@ import n8nRoutes from './routes/n8n.routes';
 import settingsRoutes from './routes/settings.routes';
 import relayRoutes from './routes/relay.routes';
 import ofertasRoutes from './routes/ofertas.routes';
+import agendamentoRoutes from './routes/agendamento.routes';
 import n8nCompatRoutes from './routes/n8n-compat.routes';
 import { errorHandler } from './middleware/errorHandler';
 
@@ -34,6 +35,7 @@ export function criarApp(): express.Application {
   app.use('/api/v1/settings', settingsRoutes);
   app.use('/api/v1/relay', relayRoutes);
   app.use('/api/v1/ofertas', ofertasRoutes);
+  app.use('/api/v1/agendamento', agendamentoRoutes);
   // Rotas de compatibilidade com o workflow n8n antigo (mesmo path do backend anterior)
   app.use('/api/n8n', n8nCompatRoutes);
 

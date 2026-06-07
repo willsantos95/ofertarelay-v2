@@ -4,6 +4,8 @@ import { parse as parseHtml } from 'node-html-parser';
 import { pool } from '../config/database';
 import { autenticacaoRequerida, RequestComUsuario } from '../middleware/authRequired';
 import { logger } from '../utils/logger';
+import { enviarOfertaWhatsApp, enviarOfertaTelegram } from '../services/envio.service';
+import { melhorarLegendaIA, iaConfigurada } from '../services/ia.service';
 
 const router = Router();
 
@@ -669,203 +671,62 @@ router.post('/:id/gerar-link-afiliado', autenticacaoRequerida, async (req: Reque
 
 // POST /api/v1/ofertas/:id/enviar-whatsapp
 router.post('/:id/enviar-whatsapp', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
-  const { id }    = req.params;
+  const { id } = req.params;
   const { legenda, grupos } = req.body as { legenda: string; grupos?: string[] };
-  const usuarioId = req.usuario!.id;
-
   try {
-    // Buscar oferta
-    const ofertaResult = await pool.query('SELECT * FROM ofertas WHERE id = $1', [id]);
-    if (!ofertaResult.rows.length) {
-      res.status(404).json({ sucesso: false, erro: { mensagem: 'Oferta não encontrada.' } });
-      return;
-    }
-    const oferta = ofertaResult.rows[0] as { imagem_url: string | null };
-
-    // Buscar instância WhatsApp conectada
-    const instResult = await pool.query(
-      `SELECT nome_instancia FROM whatsapp_instances
-       WHERE usuario_id = $1 AND status = 'conectado'
-       ORDER BY criado_em DESC LIMIT 1`,
-      [usuarioId]
-    );
-    if (!instResult.rows.length) {
-      res.status(400).json({ sucesso: false, erro: { mensagem: 'WhatsApp não está conectado.' } });
-      return;
-    }
-    const nomeInstancia = instResult.rows[0].nome_instancia as string;
-
-    // Grupos de destino: usa os fornecidos ou busca os configurados
-    let gruposDestino: string[] = grupos || [];
-    if (!gruposDestino.length) {
-      const gr = await pool.query(
-        `SELECT group_jid FROM usuario_whatsapp_grupos
-         WHERE usuario_id = $1 AND papel = 'destino' AND deletado_em IS NULL`,
-        [usuarioId]
-      );
-      gruposDestino = gr.rows.map((r: { group_jid: string }) => r.group_jid);
-    }
-
-    if (!gruposDestino.length) {
-      res.status(400).json({ sucesso: false, erro: { mensagem: 'Nenhum grupo de destino configurado. Configure na página Grupos.' } });
-      return;
-    }
-
-    const evoUrl = process.env.EVOLUTION_API_URL || '';
-    const evoKey = process.env.EVOLUTION_API_KEY || '';
-    const enviados: string[] = [];
-    const erros:    string[] = [];
-
-    for (const groupJid of gruposDestino) {
-      try {
-        let endpoint: string;
-        let body: Record<string, unknown>;
-
-        if (oferta.imagem_url) {
-          // Enviar imagem com legenda
-          endpoint = `/message/sendMedia/${nomeInstancia}`;
-          body = {
-            number:    groupJid,
-            mediatype: 'image',
-            media:     oferta.imagem_url,
-            mimetype:  'image/jpeg',
-            caption:   legenda,
-          };
-        } else {
-          // Sem imagem — enviar só texto
-          endpoint = `/message/sendText/${nomeInstancia}`;
-          body = { number: groupJid, text: legenda };
-        }
-
-        const resp = await fetch(`${evoUrl}${endpoint}`, {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json', apikey: evoKey },
-          body:    JSON.stringify(body),
-          signal:  AbortSignal.timeout(15000),
-        });
-
-        if (resp.ok) {
-          enviados.push(groupJid);
-        } else {
-          const txt = await resp.text();
-          erros.push(`${groupJid}: ${txt.slice(0, 120)}`);
-        }
-      } catch (err) {
-        erros.push(`${groupJid}: ${(err as Error).message}`);
-      }
-    }
-
-    // Marcar como enviado se pelo menos um grupo recebeu
-    if (enviados.length > 0) {
-      await pool.query(
-        `UPDATE ofertas SET status = 'enviado', atualizado_em = NOW() WHERE id = $1`,
-        [id]
-      );
-    }
-
-    logger.info({ id, enviados: enviados.length, erros }, 'Oferta enviada ao WhatsApp');
-    res.json({ sucesso: true, enviados: enviados.length, erros });
+    const r = await enviarOfertaWhatsApp(req.usuario!.id, id, legenda, grupos);
+    res.json({ sucesso: true, enviados: r.enviados, erros: r.erros });
   } catch (erro) {
-    logger.error({ erro }, 'Erro ao enviar oferta para WhatsApp');
-    res.status(500).json({ sucesso: false, erro: { mensagem: (erro as Error).message } });
+    res.status(400).json({ sucesso: false, erro: { mensagem: (erro as Error).message } });
   }
 });
 
 // POST /api/v1/ofertas/:id/enviar-telegram
 router.post('/:id/enviar-telegram', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
-  const { id }    = req.params;
+  const { id } = req.params;
   const { legenda, chatIds } = req.body as { legenda: string; chatIds?: string[] };
-  const usuarioId = req.usuario!.id;
+  try {
+    const r = await enviarOfertaTelegram(req.usuario!.id, id, legenda, chatIds);
+    res.json({ sucesso: true, enviados: r.enviados, erros: r.erros });
+  } catch (erro) {
+    res.status(400).json({ sucesso: false, erro: { mensagem: (erro as Error).message } });
+  }
+});
+
+// POST /api/v1/ofertas/:id/legenda-ia  — reescreve a legenda com IA
+router.post('/:id/legenda-ia', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
+  const { id } = req.params;
+  const { legenda } = req.body as { legenda?: string };
+
+  if (!iaConfigurada()) {
+    res.status(400).json({ sucesso: false, erro: { mensagem: 'IA não configurada no servidor (defina OPENAI_API_KEY).' } });
+    return;
+  }
 
   try {
-    // Buscar configurações reais do Telegram (sem mascaramento)
-    const tgResult = await pool.query(
-      `SELECT payload FROM user_settings WHERE usuario_id = $1 AND tipo = 'telegram'`,
-      [usuarioId]
+    const r = await pool.query(
+      `SELECT nome, preco, desconto_pct, link_produto, link_afiliado, plataforma FROM ofertas WHERE id = $1`,
+      [id]
     );
-    if (!tgResult.rows.length) {
-      res.status(400).json({ sucesso: false, erro: { mensagem: 'Telegram não configurado.' } });
-      return;
-    }
-
-    const tg = tgResult.rows[0].payload as { botToken: string; chatIds: string[]; status: string };
-    if (tg.status !== 'active') {
-      res.status(400).json({ sucesso: false, erro: { mensagem: 'Telegram não está ativo.' } });
-      return;
-    }
-    if (!tg.botToken) {
-      res.status(400).json({ sucesso: false, erro: { mensagem: 'Bot Token do Telegram não configurado.' } });
-      return;
-    }
-
-    const destinos: string[] = chatIds?.length ? chatIds : (tg.chatIds || []);
-    if (!destinos.length) {
-      res.status(400).json({ sucesso: false, erro: { mensagem: 'Nenhum Chat ID configurado no Telegram.' } });
-      return;
-    }
-
-    // Buscar oferta
-    const ofertaResult = await pool.query('SELECT imagem_url FROM ofertas WHERE id = $1', [id]);
-    if (!ofertaResult.rows.length) {
+    if (!r.rows.length) {
       res.status(404).json({ sucesso: false, erro: { mensagem: 'Oferta não encontrada.' } });
       return;
     }
-    const oferta = ofertaResult.rows[0] as { imagem_url: string | null };
-
-    const enviados: string[] = [];
-    const erros:    string[] = [];
-
-    for (const chatId of destinos) {
-      try {
-        let endpoint: string;
-        let body: Record<string, unknown>;
-
-        if (oferta.imagem_url) {
-          endpoint = `https://api.telegram.org/bot${tg.botToken}/sendPhoto`;
-          body = {
-            chat_id:    chatId,
-            photo:      oferta.imagem_url,
-            caption:    legenda,
-            parse_mode: 'Markdown',
-          };
-        } else {
-          endpoint = `https://api.telegram.org/bot${tg.botToken}/sendMessage`;
-          body = {
-            chat_id:    chatId,
-            text:       legenda,
-            parse_mode: 'Markdown',
-          };
-        }
-
-        const resp = await fetch(endpoint, {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify(body),
-          signal:  AbortSignal.timeout(15000),
-        });
-
-        const data = await resp.json() as { ok: boolean; description?: string };
-        if (data.ok) {
-          enviados.push(chatId);
-        } else {
-          erros.push(`${chatId}: ${data.description || 'Erro desconhecido'}`);
-        }
-      } catch (err) {
-        erros.push(`${chatId}: ${(err as Error).message}`);
-      }
-    }
-
-    if (enviados.length > 0) {
-      await pool.query(
-        `UPDATE ofertas SET status = 'enviado', atualizado_em = NOW() WHERE id = $1`,
-        [id]
-      );
-    }
-
-    logger.info({ id, enviados: enviados.length, erros }, 'Oferta enviada ao Telegram');
-    res.json({ sucesso: true, enviados: enviados.length, erros });
+    const o = r.rows[0] as {
+      nome: string; preco: string; desconto_pct: number | null;
+      link_produto: string | null; link_afiliado: string | null; plataforma: string;
+    };
+    const link = o.link_afiliado || o.link_produto || '';
+    const nova = await melhorarLegendaIA(legenda || '', {
+      nome: o.nome,
+      preco: o.preco,
+      plataforma: o.plataforma === 'shopee' ? 'Shopee' : 'Mercado Livre',
+      link,
+      descontoPct: o.desconto_pct,
+    });
+    res.json({ sucesso: true, legenda: nova });
   } catch (erro) {
-    logger.error({ erro }, 'Erro ao enviar oferta para Telegram');
+    logger.error({ erro }, 'Erro ao gerar legenda com IA');
     res.status(500).json({ sucesso: false, erro: { mensagem: (erro as Error).message } });
   }
 });
