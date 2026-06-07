@@ -30,12 +30,16 @@ async function getMLCredenciais(usuarioId: string) {
   if (!r.rows.length) return null;
   const ml = (r.rows[0].payload as Record<string, Record<string, string>>)?.mercadoLivre;
   if (!ml?.tag || !ml?.cookies) return null;
-  // URLs: uma por linha (campo opcional)
   const urls = (ml.urls || '')
     .split('\n')
     .map((u: string) => u.trim())
     .filter((u: string) => u.startsWith('http'));
-  return { tag: ml.tag, cookies: ml.cookies, urls };
+  return {
+    tag:       ml.tag,
+    cookies:   ml.cookies,
+    csrfToken: ml.csrfToken || '',   // x-csrf-token header (diferente do cookie _csrf)
+    urls,
+  };
 }
 
 // ─────────────────────────────────────────────
@@ -169,19 +173,28 @@ async function scrapeMLPage(url: string, cookies = ''): Promise<MLProduto[]> {
   const root = parseHtml(html);
 
   const produtos: MLProduto[] = [];
-  const cards = root.querySelectorAll('.poly-card__content');
+
+  // Busca o .poly-card PAI (que contém tanto .poly-card__portada com a imagem
+  // quanto .poly-card__content com título, preço e link)
+  const cards = root.querySelectorAll('.poly-card');
 
   for (const card of cards) {
-    const aEl     = card.querySelector('h3 > a');
-    const imgEl   = card.querySelector('img.poly-component__picture');
-    const precoEl = card.querySelector('div.poly-component__price');
+    const content  = card.querySelector('.poly-card__content');
+    if (!content) continue;
 
-    const nome       = aEl?.text?.trim()                        || '';
-    const linkCompra = aEl?.getAttribute('href')                || '';
-    const imagem     = imgEl?.getAttribute('src') || imgEl?.getAttribute('data-src') || '';
-    const precoRaw   = precoEl?.text?.trim()                    || '';
+    const aEl     = content.querySelector('h3 > a');
+    const precoEl = content.querySelector('div.poly-component__price');
 
-    // Filtrar links patrocinados (click1.mercadolivre)
+    // Imagem está na div irmã (.poly-card__portada), não dentro do content
+    const imgEl = card.querySelector('img.poly-component__picture');
+
+    const nome       = aEl?.text?.trim()  || '';
+    const linkCompra = aEl?.getAttribute('href') || '';
+    // src pode ser placeholder em lazy load; data-src tem a URL real
+    const imagem = imgEl?.getAttribute('data-src') || imgEl?.getAttribute('src') || '';
+    const precoRaw   = precoEl?.text?.trim() || '';
+
+    // Filtrar links patrocinados (click1.mercadolivre) e sem nome
     if (!nome || !linkCompra || linkCompra.includes('click1.mercadolivre')) continue;
     if (!linkCompra.includes('mercadolivre.com.br')) continue;
 
@@ -191,10 +204,18 @@ async function scrapeMLPage(url: string, cookies = ''): Promise<MLProduto[]> {
   return produtos;
 }
 
-/** Gera link de afiliado do ML via API do programa de afiliados */
-async function gerarLinkAfiliadoML(url: string, tag: string, cookies: string): Promise<string | null> {
-  const csrfMatch = cookies.match(/_csrf=([^;]+)/);
-  const csrfToken = csrfMatch ? csrfMatch[1] : '';
+/**
+ * Gera link de afiliado do ML via API do programa de afiliados.
+ * csrfToken = valor do header x-csrf-token (diferente do cookie _csrf).
+ * O usuário obtém copiando de F12 → Network → qualquer req ao ML → header x-csrf-token.
+ */
+async function gerarLinkAfiliadoML(
+  url: string,
+  tag: string,
+  cookies: string,
+  csrfToken: string,
+): Promise<string | null> {
+  if (!cookies || !tag) return null;
 
   try {
     const resp = await fetch(
@@ -202,26 +223,31 @@ async function gerarLinkAfiliadoML(url: string, tag: string, cookies: string): P
       {
         method: 'POST',
         headers: {
-          'Content-Type':   'application/json',
-          'accept':         'application/json, text/plain, */*',
+          'Content-Type':    'application/json',
+          'accept':          'application/json, text/plain, */*',
           'accept-language': 'pt-BR,pt;q=0.9',
-          'origin':         'https://www.mercadolivre.com.br',
-          'referer':        'https://www.mercadolivre.com.br/afiliados/linkbuilder',
-          'user-agent':     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'x-csrf-token':   csrfToken,
-          'cookie':         cookies,
-          'sec-fetch-dest': 'empty',
-          'sec-fetch-mode': 'cors',
-          'sec-fetch-site': 'same-origin',
+          'origin':          'https://www.mercadolivre.com.br',
+          'referer':         'https://www.mercadolivre.com.br/afiliados/linkbuilder',
+          'user-agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'x-csrf-token':    csrfToken,
+          'cookie':          cookies,
+          'sec-fetch-dest':  'empty',
+          'sec-fetch-mode':  'cors',
+          'sec-fetch-site':  'same-origin',
         },
         body: JSON.stringify({ urls: [url], tag }),
         signal: AbortSignal.timeout(10000),
       }
     );
-    if (!resp.ok) return null;
+
+    if (!resp.ok) {
+      logger.warn({ status: resp.status, url }, 'ML affiliate link falhou');
+      return null;
+    }
     const data = await resp.json() as { urls?: { short_url?: string }[] };
     return data?.urls?.[0]?.short_url || null;
-  } catch {
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, 'Erro ao gerar link afiliado ML');
     return null;
   }
 }
@@ -307,8 +333,8 @@ router.post('/sincronizar/mercadolivre', autenticacaoRequerida, async (req: Requ
           const { precoFinal, precoOriginal, descontoPct } = parsePrecosML(p.precoRaw);
           if (!precoFinal || precoFinal < MIN_PRECO) { totalIgnorados++; continue; }
 
-          // Gerar link de afiliado (pode falhar se cookies expiraram — usa original como fallback)
-          let linkAfiliado = await gerarLinkAfiliadoML(p.linkCompra, creds.tag, creds.cookies);
+          // Gerar link de afiliado (usa csrfToken do settings; fallback para link original)
+          let linkAfiliado = await gerarLinkAfiliadoML(p.linkCompra, creds.tag, creds.cookies, creds.csrfToken);
           if (!linkAfiliado) linkAfiliado = p.linkCompra;
 
           const r = await pool.query(
