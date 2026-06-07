@@ -17,6 +17,50 @@ export const filaSync = new Bull('whatsapp-sync', {
 function getEvolutionUrl() { return process.env.EVOLUTION_API_URL || ''; }
 function getEvolutionKey() { return process.env.EVOLUTION_API_KEY || ''; }
 
+// Webhook do n8n que configura o webhook do Evolution para a instância.
+// Configurável por env; mantém a URL do projeto anterior como padrão.
+function getN8nWebhookConectar() {
+  return process.env.N8N_WEBHOOK_CONECTAR
+    || 'https://n8n.relampagodeofertas.shop/webhook/2a92f9c3-48bc-46d8-a9fe-8ca817ae1481';
+}
+
+/**
+ * Notifica o n8n quando uma instância conecta, para que ele configure o
+ * webhook no Evolution API. Fire-and-forget: nunca quebra o fluxo de conexão.
+ */
+function notificarN8nConexao(nomeInstancia: string, instanciaId: string, telefone: string, usuarioId: string): void {
+  const url = getN8nWebhookConectar();
+  if (!url) return;
+
+  // Envia o id da instância sob várias chaves para máxima compatibilidade
+  const payload = {
+    id:           nomeInstancia,
+    instance:     nomeInstancia,
+    instanceId:   nomeInstancia,
+    instanceName: nomeInstancia,
+    instanceDbId: instanciaId,
+    telefone,
+    usuarioId,
+  };
+
+  (async () => {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      logger.info({ nomeInstancia, status: resp.status }, 'Webhook n8n (conectar) notificado');
+    } catch (err) {
+      logger.warn({ nomeInstancia, err: (err as Error).message }, 'Falha ao notificar webhook n8n (conectar)');
+    }
+  })();
+}
+
 // Busca o QR em múltiplos campos possíveis (compatível com v1 e v2)
 function normalizeQrCode(data: Record<string, unknown>): string | null {
   return (
@@ -141,6 +185,9 @@ router.post(
          WHERE id = $3`,
         [qrcode, pairingCode, instanciaId]
       );
+
+      // 5. Notificar o n8n para configurar o webhook do Evolution (fire-and-forget)
+      notificarN8nConexao(nomeInstancia, instanciaId, telefone, usuarioId);
 
       res.status(201).json({
         sucesso: true,
