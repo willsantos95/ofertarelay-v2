@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   provider_subscription_id VARCHAR(255),
   status_pagamento VARCHAR(50) NOT NULL DEFAULT 'pendente',
   nome_plano VARCHAR(100),
-  valor INTEGER,
+  valor NUMERIC(10,2),
   moeda VARCHAR(10) DEFAULT 'BRL',
   proxima_cobranca TIMESTAMPTZ,
   chave_idempotencia VARCHAR(255) UNIQUE,

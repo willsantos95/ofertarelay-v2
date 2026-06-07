@@ -13,7 +13,7 @@ function getMpSecret()      { return process.env.MERCADOPAGO_WEBHOOK_SECRET || '
 function getAppUrl()        { return process.env.APP_URL || ''; }
 function getFrontendUrl()   { return process.env.FRONTEND_URL || ''; }
 function getPlanName()      { return process.env.PLAN_NAME || 'OfertaRelay Pro'; }
-function getPlanAmount()    { return Number(process.env.PLAN_AMOUNT || 199); }
+function getPlanAmount()    { return parseFloat(process.env.PLAN_AMOUNT || '199'); }
 function getPlanCurrency()  { return process.env.PLAN_CURRENCY || 'BRL'; }
 
 function getCheckoutUrl(data: Record<string, unknown>): string | null {
