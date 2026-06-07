@@ -21,11 +21,12 @@ async function getShopeeCredenciais(usuarioId: string): Promise<{ appId: string;
   return { appId: shopee.appId, appSecret: shopee.appSecret };
 }
 
-// Tipos de listagem da API Shopee (sem IDs de categoria — não precisam de productCatId)
-// listType: 1 = top produtos por comissão | listType: 2 = flash sale
+// Listas da API Shopee Affiliate (productCatId: 0 = todas as categorias)
+// listType: 0 + productCatId: 0 = produtos gerais top comissão
+// listType: 2                   = flash sale
 const LISTAS_SHOPEE = [
-  { listType: 1, nome: 'Top Comissão' },
-  { listType: 2, nome: 'Flash Sale'   },
+  { query: 'productOfferV2(listType: 0, productCatId: 0, limit: 50)', nome: 'Top Comissão' },
+  { query: 'productOfferV2(listType: 2, limit: 50)',                   nome: 'Flash Sale'   },
 ];
 
 // Filtros mínimos (preço > R$20 e comissão > 5%)
@@ -53,14 +54,13 @@ function shopeeSign(appId: string, timestamp: string, payload: object, secret: s
 }
 
 /**
- * Busca ofertas pelo tipo de listagem (sem filtro de categoria).
- * listType: 1 = top comissão, listType: 2 = flash sale
+ * Busca ofertas usando a query pré-montada.
  */
-async function buscarLista(listType: number, appId: string, secret: string): Promise<ProdutoShopee[]> {
+async function buscarLista(queryPart: string, appId: string, secret: string): Promise<ProdutoShopee[]> {
   const timestamp = Math.floor(Date.now() / 1000).toString();
 
   const payload = {
-    query: `{ productOfferV2(listType: ${listType}, limit: 50) { nodes { itemId commissionRate commission imageUrl price productLink offerLink productName } } }`,
+    query: `{ ${queryPart} { nodes { itemId commissionRate commission imageUrl price productLink offerLink productName } } }`,
   };
 
   const signature = shopeeSign(appId, timestamp, payload, secret);
@@ -108,7 +108,7 @@ router.post('/sincronizar', autenticacaoRequerida, async (req: RequestComUsuario
 
     for (const lista of LISTAS_SHOPEE) {
       try {
-        const produtos = await buscarLista(lista.listType, creds.appId, creds.appSecret);
+        const produtos = await buscarLista(lista.query, creds.appId, creds.appSecret);
 
         for (const p of produtos) {
           const preco        = parseFloat(String(p.price));
