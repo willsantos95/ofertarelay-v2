@@ -107,13 +107,12 @@ router.post('/checkout', autenticacaoRequerida, async (req: RequestComUsuario, r
 
     const checkoutUrl = getCheckoutUrl(data);
 
+    // Cada checkout cria um novo preapproval no MP com ID único — sem conflito possível
     await pool.query(
       `INSERT INTO subscriptions
          (usuario_id, provider, provider_subscription_id, provider_customer_id,
           nome_plano, valor, moeda, status_pagamento, checkout_url, criado_em, atualizado_em)
-       VALUES ($1, 'mercadopago', $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
-       ON CONFLICT (provider_subscription_id)
-       DO UPDATE SET checkout_url = EXCLUDED.checkout_url, status_pagamento = EXCLUDED.status_pagamento, atualizado_em = NOW()`,
+       VALUES ($1, 'mercadopago', $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())`,
       [usuario.id, data.id, (data as Record<string, string>).payer_id || null,
        getPlanName(), getPlanAmount(), getPlanCurrency(),
        (data as Record<string, string>).status || 'pending', checkoutUrl]
@@ -277,34 +276,49 @@ router.post('/webhook/mercadopago', limitadorWebhook, async (req: Request, res: 
 
     const autoRec = subscription.auto_recurring as Record<string, unknown> | undefined;
 
-    await pool.query(
-      `INSERT INTO subscriptions
-         (usuario_id, provider, provider_subscription_id, provider_customer_id,
-          nome_plano, valor, moeda, status_pagamento, checkout_url,
-          started_at, next_payment_at, cancelled_at, criado_em, atualizado_em)
-       VALUES ($1,'mercadopago',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),NOW())
-       ON CONFLICT (provider_subscription_id)
-       DO UPDATE SET
-         status_pagamento = EXCLUDED.status_pagamento,
-         checkout_url     = EXCLUDED.checkout_url,
-         started_at       = EXCLUDED.started_at,
-         next_payment_at  = EXCLUDED.next_payment_at,
-         cancelled_at     = EXCLUDED.cancelled_at,
-         atualizado_em    = NOW()`,
-      [
-        userId,
-        subscription.id,
-        (subscription.payer_id as string) || null,
-        (subscription.reason as string) || getPlanName(),
-        autoRec?.transaction_amount || getPlanAmount(),
-        getPlanCurrency(),
-        providerStatus,
-        getCheckoutUrl(subscription),
-        null, // started_at
-        (subscription.next_payment_date as string) || null,
-        providerStatus === 'cancelled' ? new Date() : null,
-      ]
+    // Upsert sem ON CONFLICT para evitar dependência de constraint UNIQUE
+    const existingSub = await pool.query(
+      `SELECT id FROM subscriptions WHERE provider_subscription_id = $1 LIMIT 1`,
+      [subscription.id]
     );
+
+    if (existingSub.rows.length > 0) {
+      await pool.query(
+        `UPDATE subscriptions SET
+           status_pagamento = $1, checkout_url = $2,
+           next_payment_at  = $3, cancelled_at = $4,
+           atualizado_em    = NOW()
+         WHERE id = $5`,
+        [
+          providerStatus,
+          getCheckoutUrl(subscription),
+          (subscription.next_payment_date as string) || null,
+          providerStatus === 'cancelled' ? new Date() : null,
+          existingSub.rows[0].id,
+        ]
+      );
+    } else {
+      await pool.query(
+        `INSERT INTO subscriptions
+           (usuario_id, provider, provider_subscription_id, provider_customer_id,
+            nome_plano, valor, moeda, status_pagamento, checkout_url,
+            started_at, next_payment_at, cancelled_at, criado_em, atualizado_em)
+         VALUES ($1,'mercadopago',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),NOW())`,
+        [
+          userId,
+          subscription.id,
+          (subscription.payer_id as string) || null,
+          (subscription.reason as string) || getPlanName(),
+          autoRec?.transaction_amount || getPlanAmount(),
+          getPlanCurrency(),
+          providerStatus,
+          getCheckoutUrl(subscription),
+          null, // started_at
+          (subscription.next_payment_date as string) || null,
+          providerStatus === 'cancelled' ? new Date() : null,
+        ]
+      );
+    }
 
     await pool.query(
       `UPDATE users SET status_plano = $1, atualizado_em = NOW() WHERE id = $2`,

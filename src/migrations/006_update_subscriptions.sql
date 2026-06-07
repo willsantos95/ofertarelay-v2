@@ -6,7 +6,5 @@ ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
 ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS next_payment_at TIMESTAMPTZ;
 ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ;
 
--- Garantir constraint única em provider_subscription_id para o ON CONFLICT
-CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_provider_sub_id
-  ON subscriptions(provider_subscription_id)
-  WHERE provider_subscription_id IS NOT NULL;
+-- Converter valor para suportar casas decimais (ex: 49.90)
+ALTER TABLE subscriptions ALTER COLUMN valor TYPE NUMERIC(10,2);
