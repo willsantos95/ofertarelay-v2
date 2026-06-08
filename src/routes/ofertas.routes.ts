@@ -548,6 +548,11 @@ router.post('/:id/legenda-ia', autenticacaoRequerida, async (req: RequestComUsua
     return;
   }
 
+  if (!legenda || !legenda.trim()) {
+    res.status(400).json({ sucesso: false, erro: { mensagem: 'Legenda obrigatória para melhoria com IA.' } });
+    return;
+  }
+
   try {
     const r = await pool.query(
       `SELECT nome, preco, desconto_pct, link_produto, link_afiliado, plataforma FROM ofertas WHERE id = $1`,
