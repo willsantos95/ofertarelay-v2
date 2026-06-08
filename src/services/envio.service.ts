@@ -34,8 +34,12 @@ export function gerarLegendaPadrao(o: OfertaLegenda): string {
   return `🛍️ *${o.nome}*\n\n_Vendido ${prep} ${plat}_\n\n💰 Por *${precoStr}*\n🛒 ${link}`;
 }
 
-async function marcarOfertaEnviada(ofertaId: string): Promise<void> {
-  await pool.query(`UPDATE ofertas SET status = 'enviado', atualizado_em = NOW() WHERE id = $1`, [ofertaId]);
+async function marcarOfertaEnviada(ofertaId: string, usuarioId: string): Promise<void> {
+  await pool.query(
+    `INSERT INTO ofertas_enviadas (oferta_id, usuario_id)
+     VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+    [ofertaId, usuarioId]
+  );
 }
 
 /**
@@ -133,7 +137,7 @@ export async function enviarOfertaWhatsApp(
     }
   }
 
-  if (enviados.length > 0) await marcarOfertaEnviada(ofertaId);
+  if (enviados.length > 0) await marcarOfertaEnviada(ofertaId, usuarioId);
   logger.info({ ofertaId, enviados: enviados.length, erros }, 'Oferta enviada ao WhatsApp');
   return { enviados: enviados.length, erros };
 }
@@ -191,7 +195,7 @@ export async function enviarOfertaTelegram(
     }
   }
 
-  if (enviados.length > 0) await marcarOfertaEnviada(ofertaId);
+  if (enviados.length > 0) await marcarOfertaEnviada(ofertaId, usuarioId);
   logger.info({ ofertaId, enviados: enviados.length, erros }, 'Oferta enviada ao Telegram');
   return { enviados: enviados.length, erros };
 }

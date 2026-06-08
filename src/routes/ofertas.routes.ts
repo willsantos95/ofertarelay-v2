@@ -365,35 +365,51 @@ router.post('/sincronizar/mercadolivre', autenticacaoRequerida, async (req: Requ
 });
 
 // GET /api/v1/ofertas
-router.get('/', autenticacaoRequerida, async (req: Request, res: Response): Promise<void> => {
+router.get('/', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
+  const usuarioId = req.usuario!.id;
   const { categoria, status, plataforma, pagina = '1', limite = '24' } = req.query as Record<string, string>;
   const pg  = Math.max(1, parseInt(pagina));
   const lim = Math.min(100, Math.max(1, parseInt(limite)));
   const offset = (pg - 1) * lim;
 
+  // $1 é sempre o usuarioId (para o LEFT JOIN de enviado_por_mim)
+  const params: unknown[] = [usuarioId];
   const filtros: string[] = [];
-  const params: unknown[] = [];
-  let idx = 1;
+  let idx = 2;
 
-  if (categoria)  { filtros.push(`categoria_nome = $${idx++}`); params.push(categoria); }
-  if (status)     { filtros.push(`status = $${idx++}`);         params.push(status); }
-  if (plataforma) { filtros.push(`plataforma = $${idx++}`);     params.push(plataforma); }
+  if (categoria)  { filtros.push(`o.categoria_nome = $${idx++}`); params.push(categoria); }
+  if (plataforma) { filtros.push(`o.plataforma = $${idx++}`);     params.push(plataforma); }
+
+  // Filtro de status é agora por usuário: "enviado" = tem registro em ofertas_enviadas
+  if (status === 'enviado')  filtros.push('oe.oferta_id IS NOT NULL');
+  if (status === 'pendente') filtros.push('oe.oferta_id IS NULL');
 
   const where = filtros.length ? `WHERE ${filtros.join(' AND ')}` : '';
 
   try {
     const [rows, total] = await Promise.all([
       pool.query(
-        `SELECT id, item_id, nome, preco, preco_original, desconto_pct,
-                imagem_url, link_produto, link_afiliado,
-                comissao, taxa_comissao, categoria_id, categoria_nome,
-                plataforma, status, criado_em
-         FROM ofertas ${where}
-         ORDER BY criado_em DESC
+        `SELECT o.id, o.item_id, o.nome, o.preco, o.preco_original, o.desconto_pct,
+                o.imagem_url, o.link_produto, o.link_afiliado,
+                o.comissao, o.taxa_comissao, o.categoria_id, o.categoria_nome,
+                o.plataforma, o.criado_em,
+                (oe.oferta_id IS NOT NULL) AS enviado_por_mim
+         FROM ofertas o
+         LEFT JOIN ofertas_enviadas oe
+           ON oe.oferta_id = o.id AND oe.usuario_id = $1
+         ${where}
+         ORDER BY o.criado_em DESC
          LIMIT $${idx} OFFSET $${idx + 1}`,
         [...params, lim, offset]
       ),
-      pool.query(`SELECT COUNT(*) FROM ofertas ${where}`, params),
+      pool.query(
+        `SELECT COUNT(*)
+         FROM ofertas o
+         LEFT JOIN ofertas_enviadas oe
+           ON oe.oferta_id = o.id AND oe.usuario_id = $1
+         ${where}`,
+        params
+      ),
     ]);
 
     res.json({
@@ -581,16 +597,28 @@ router.post('/:id/legenda-ia', autenticacaoRequerida, async (req: RequestComUsua
   }
 });
 
-// PATCH /api/v1/ofertas/:id/status
-router.patch('/:id/status', autenticacaoRequerida, async (req: Request, res: Response): Promise<void> => {
-  const { id } = req.params;
-  const { status } = req.body as { status: string };
+// PATCH /api/v1/ofertas/:id/status  — controle de enviado POR USUÁRIO
+router.patch('/:id/status', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
+  const { id }      = req.params;
+  const usuarioId   = req.usuario!.id;
+  const { status }  = req.body as { status: string };
   if (!['pendente', 'enviado'].includes(status)) {
     res.status(400).json({ sucesso: false, erro: { mensagem: 'Status inválido.' } });
     return;
   }
   try {
-    await pool.query(`UPDATE ofertas SET status=$1, atualizado_em=NOW() WHERE id=$2`, [status, id]);
+    if (status === 'enviado') {
+      await pool.query(
+        `INSERT INTO ofertas_enviadas (oferta_id, usuario_id)
+         VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [id, usuarioId]
+      );
+    } else {
+      await pool.query(
+        `DELETE FROM ofertas_enviadas WHERE oferta_id = $1 AND usuario_id = $2`,
+        [id, usuarioId]
+      );
+    }
     res.json({ sucesso: true });
   } catch (erro) {
     res.status(500).json({ sucesso: false, erro: { mensagem: (erro as Error).message } });
