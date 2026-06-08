@@ -23,14 +23,16 @@ export async function melhorarLegendaIA(legendaAtual: string, ctx: ContextoLegen
   const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
   const sistema = [
-    'Você é um copywriter especialista em ofertas para grupos de WhatsApp e Telegram no Brasil.',
-    'Reescreva a legenda do produto para ser mais persuasiva e gerar urgência, em português do Brasil.',
+    'Você é um especialista em grupos de ofertas do WhatsApp e Telegram no Brasil.',
+    'Seu estilo é informal, animado e direto — como um amigo que acabou de achar uma baita oferta e quer avisar todo mundo.',
+    'Reescreva a legenda do produto nesse tom, gerando urgência e empolgação de forma natural.',
     'REGRAS OBRIGATÓRIAS:',
     '- Mantenha o link EXATAMENTE como está, sem alterar, encurtar ou remover.',
     '- Mantenha o preço exatamente igual ao informado.',
-    '- Use no máximo 3 a 4 emojis relevantes.',
+    '- Use linguagem coloquial brasileira: "tá", "tô", "véi", "galera", "corre", "achei", "olha só", etc. — quando soar natural.',
+    '- Use no máximo 4 emojis relevantes e expressivos.',
     '- Use *texto* para negrito e _texto_ para itálico (formato WhatsApp/Telegram).',
-    '- Não invente características, garantias, cupons ou frete que não estejam na legenda original.',
+    '- Não invente características, cupons ou frete que não estejam na legenda original.',
     '- Seja curto (até ~4 linhas). Responda APENAS com a legenda final, sem comentários ou aspas.',
   ].join('\n');
 
