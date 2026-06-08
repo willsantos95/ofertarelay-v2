@@ -11,6 +11,7 @@ import ofertasRoutes from './routes/ofertas.routes';
 import agendamentoRoutes from './routes/agendamento.routes';
 import afiliadoRoutes from './routes/afiliado.routes';
 import n8nCompatRoutes from './routes/n8n-compat.routes';
+import ajudaRoutes from './routes/ajuda.routes';
 import { errorHandler } from './middleware/errorHandler';
 
 export function criarApp(): express.Application {
@@ -40,6 +41,8 @@ export function criarApp(): express.Application {
   app.use('/api/v1/afiliado', afiliadoRoutes);
   // Rotas de compatibilidade com o workflow n8n antigo (mesmo path do backend anterior)
   app.use('/api/n8n', n8nCompatRoutes);
+  // Chat de suporte com IA (público — sem autenticação)
+  app.use('/api/v1/ajuda', ajudaRoutes);
 
   app.use(errorHandler);
 
