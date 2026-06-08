@@ -6,7 +6,8 @@ import { logger } from '../utils/logger';
 import { enviarOfertaWhatsApp, enviarOfertaTelegram } from '../services/envio.service';
 import { melhorarLegendaIA, iaConfigurada } from '../services/ia.service';
 import {
-  getShopeeCredenciais, getMLCredenciais, shopeeSign, gerarLinkAfiliadoML,
+  getShopeeCredenciais, getMLCredenciais, shopeeSign,
+  gerarShortLinkShopee, gerarLinkAfiliadoML, persistirCookiesML,
 } from '../services/afiliado.service';
 
 const router = Router();
@@ -445,7 +446,7 @@ router.delete('/', autenticacaoRequerida, async (req: Request, res: Response): P
 });
 
 // POST /api/v1/ofertas/:id/gerar-link-afiliado
-// Gera (ou renova) o link de afiliado ML com refresh de cookies
+// Gera o link de afiliado do usuário logado no momento (Shopee ou ML)
 router.post('/:id/gerar-link-afiliado', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
   const { id }    = req.params;
   const usuarioId = req.usuario!.id;
@@ -464,56 +465,51 @@ router.post('/:id/gerar-link-afiliado', autenticacaoRequerida, async (req: Reque
       link_produto: string | null; link_afiliado: string | null;
     };
 
-    // Shopee já tem link de afiliado direto — retorna como está
-    if (oferta.plataforma !== 'mercadolivre') {
-      res.json({ sucesso: true, linkAfiliado: oferta.link_afiliado });
-      return;
-    }
-
-    const creds = await getMLCredenciais(usuarioId);
-    if (!creds) {
-      res.status(400).json({ sucesso: false, erro: { mensagem: 'Configure Tag e Cookies do ML na página Afiliado.' } });
-      return;
-    }
-
-    const urlProduto = oferta.link_produto || oferta.link_afiliado || '';
-    if (!urlProduto) {
+    const urlOrigem = oferta.link_produto || oferta.link_afiliado || '';
+    if (!urlOrigem) {
       res.status(400).json({ sucesso: false, erro: { mensagem: 'Oferta sem URL de produto.' } });
       return;
     }
 
-    const { shortUrl, cookiesAtualizados } = await gerarLinkAfiliadoML(urlProduto, creds.tag, creds.cookies);
-
-    if (shortUrl) {
-      // Persistir o link de afiliado gerado
-      await pool.query(
-        `UPDATE ofertas SET link_afiliado = $1, atualizado_em = NOW() WHERE id = $2`,
-        [shortUrl, id]
-      );
-
-      // Persistir os cookies renovados para a próxima chamada
-      if (cookiesAtualizados !== creds.cookies) {
-        const settingsResult = await pool.query(
-          `SELECT payload FROM user_settings WHERE usuario_id = $1 AND tipo = 'affiliate'`,
-          [usuarioId]
-        );
-        if (settingsResult.rows.length) {
-          const payload = settingsResult.rows[0].payload as Record<string, unknown>;
-          const ml = (payload.mercadoLivre || {}) as Record<string, string>;
-          await pool.query(
-            `UPDATE user_settings SET payload = $1, atualizado_em = NOW()
-             WHERE usuario_id = $2 AND tipo = 'affiliate'`,
-            [JSON.stringify({ ...payload, mercadoLivre: { ...ml, cookies: cookiesAtualizados } }), usuarioId]
-          );
-        }
+    // ── SHOPEE ──────────────────────────────────────────────────────
+    if (oferta.plataforma === 'shopee') {
+      const creds = await getShopeeCredenciais(usuarioId);
+      if (!creds) {
+        res.status(400).json({ sucesso: false, erro: { mensagem: 'Configure App ID e App Secret da Shopee na página Afiliado.' } });
+        return;
       }
-
-      res.json({ sucesso: true, linkAfiliado: shortUrl });
-    } else {
-      res.json({ sucesso: false, linkAfiliado: oferta.link_afiliado, erro: { mensagem: 'Não foi possível gerar o link. Verifique os cookies do ML.' } });
+      const shortLink = await gerarShortLinkShopee(creds.appId, creds.appSecret, urlOrigem, { usuarioId, contexto: 'manual' });
+      if (shortLink) {
+        res.json({ sucesso: true, linkAfiliado: shortLink });
+      } else {
+        res.json({ sucesso: false, linkAfiliado: oferta.link_afiliado, erro: { mensagem: 'Não foi possível gerar o short link da Shopee. Verifique suas credenciais.' } });
+      }
+      return;
     }
+
+    // ── MERCADO LIVRE ────────────────────────────────────────────────
+    if (oferta.plataforma === 'mercadolivre') {
+      const creds = await getMLCredenciais(usuarioId);
+      if (!creds) {
+        res.status(400).json({ sucesso: false, erro: { mensagem: 'Configure Tag e Cookies do ML na página Afiliado.' } });
+        return;
+      }
+      const { shortUrl, cookiesAtualizados } = await gerarLinkAfiliadoML(urlOrigem, creds.tag, creds.cookies, { usuarioId, contexto: 'manual' });
+      if (cookiesAtualizados !== creds.cookies) {
+        await persistirCookiesML(usuarioId, cookiesAtualizados);
+      }
+      if (shortUrl) {
+        res.json({ sucesso: true, linkAfiliado: shortUrl });
+      } else {
+        res.json({ sucesso: false, linkAfiliado: oferta.link_afiliado, erro: { mensagem: 'Não foi possível gerar o link. Verifique os cookies do ML.' } });
+      }
+      return;
+    }
+
+    // Plataforma desconhecida — devolve o que tiver
+    res.json({ sucesso: true, linkAfiliado: oferta.link_afiliado });
   } catch (erro) {
-    logger.error({ erro }, 'Erro ao gerar link afiliado ML');
+    logger.error({ erro }, 'Erro ao gerar link afiliado');
     res.status(500).json({ sucesso: false, erro: { mensagem: (erro as Error).message } });
   }
 });
