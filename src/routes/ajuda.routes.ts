@@ -1,3 +1,4 @@
+import rateLimit from 'express-rate-limit';
 // Rota de chat de suporte com IA para o OfertaRelay.
 // Endpoint público — não requer autenticação (suporte pré e pós login).
 
@@ -25,7 +26,17 @@ router.get('/status', (_req: Request, res: Response) => {
  * Response:
  *   { resposta: string }
  */
-router.post('/chat', async (req: Request, res: Response) => {
+// Chat público: limita por IP para não abrir a chave da OpenAI a abuso
+const limitadorChat = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: parseInt(process.env.AJUDA_RATE_LIMIT || '20'),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { sucesso: false, erro: { mensagem: 'Muitas perguntas seguidas. Tente de novo em alguns minutos.' } },
+  skip: () => process.env.NODE_ENV === 'test',
+});
+
+router.post('/chat', limitadorChat, async (req: Request, res: Response) => {
   const { mensagem, historico } = req.body as {
     mensagem?: string;
     historico?: MensagemHistorico[];

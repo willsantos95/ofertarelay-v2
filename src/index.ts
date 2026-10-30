@@ -1,15 +1,18 @@
 import 'dotenv/config';
 import { criarApp } from './server';
 import { connectDatabase } from './config/database';
+import { rodarMigrations } from './config/migrations';
 import { connectRedis } from './config/redis';
 import { logger } from './utils/logger';
 import './jobs/sincronizarGrupos';
+import './jobs/sincronizarOfertas';
 import { iniciarWorkerAgendamento } from './jobs/processarFilaAgendamento';
 
 const PORT = parseInt(process.env.PORT || '3000');
 
 async function main(): Promise<void> {
   await connectDatabase();
+  await rodarMigrations();
   await connectRedis();
 
   const app = criarApp();

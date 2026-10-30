@@ -50,10 +50,11 @@ const mockEnvio     = envioService           as jest.Mocked<typeof envioService>
 const mockIa        = iaService              as jest.Mocked<typeof iaService>;
 
 process.env.JWT_SECRET = 'segredo-teste-minimo-32-caracteres-ok';
+process.env.ADMIN_EMAILS = 'admin@ofertarelay.com';
 const app = criarApp();
 
-function token(id = 'user-test') {
-  return jwt.sign({ id, email: 'test@test.com', nome: 'Test' }, process.env.JWT_SECRET!, { expiresIn: '1d' });
+function token(id = 'user-test', email = 'test@test.com') {
+  return jwt.sign({ id, email, nome: 'Test' }, process.env.JWT_SECRET!, { expiresIn: '1d' });
 }
 
 const OFERTA_DB = {
@@ -190,7 +191,7 @@ describe('Ofertas Module', () => {
 
       const res = await request(app)
         .delete('/api/v1/ofertas')
-        .set('Authorization', `Bearer ${token()}`);
+        .set('Authorization', `Bearer ${token('user-test', 'admin@ofertarelay.com')}`);
 
       expect(res.status).toBe(200);
       expect(res.body.sucesso).toBe(true);
@@ -202,10 +203,18 @@ describe('Ofertas Module', () => {
 
       const res = await request(app)
         .delete('/api/v1/ofertas?plataforma=shopee')
-        .set('Authorization', `Bearer ${token()}`);
+        .set('Authorization', `Bearer ${token('user-test', 'admin@ofertarelay.com')}`);
 
       expect(res.status).toBe(200);
       expect(res.body.removidas).toBe(8);
+    });
+
+    test('usuário comum → 403 (o catálogo é de todos)', async () => {
+      const res = await request(app)
+        .delete('/api/v1/ofertas')
+        .set('Authorization', `Bearer ${token()}`);
+      expect(res.status).toBe(403);
+      expect(mockPool.query).not.toHaveBeenCalled();
     });
 
     test('sem autenticação → 401', async () => {
@@ -254,7 +263,7 @@ describe('Ofertas Module', () => {
       mockPool.query.mockResolvedValue({ rows: [{ inserido: true }], rowCount: 1 } as never);
 
       const res = await request(app)
-        .post('/api/v1/ofertas/sincronizar')
+        .post('/api/v1/ofertas/sincronizar?aguardar=true')
         .set('Authorization', `Bearer ${token()}`);
 
       expect(res.status).toBe(200);

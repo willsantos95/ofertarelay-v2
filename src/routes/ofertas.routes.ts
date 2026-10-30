@@ -2,7 +2,11 @@ import { Router, Request, Response } from 'express';
 import { parse as parseHtml } from 'node-html-parser';
 import { pool } from '../config/database';
 import { autenticacaoRequerida, RequestComUsuario } from '../middleware/authRequired';
+import Bull from 'bull';
 import { logger } from '../utils/logger';
+import { getRedisBullConfig } from '../config/redis';
+import { exigirAdmin } from '../middleware/admin';
+import { exigirPlanoAtivo } from '../services/plano.service';
 import { enviarOfertaWhatsApp, enviarOfertaTelegram } from '../services/envio.service';
 import { melhorarLegendaIA, iaConfigurada } from '../services/ia.service';
 import {
@@ -11,6 +15,9 @@ import {
 } from '../services/afiliado.service';
 
 const router = Router();
+
+/** Fila de sincronização do catálogo (processada em jobs/sincronizarOfertas). */
+export const filaOfertas = new Bull('ofertas-sync', { redis: getRedisBullConfig() });
 
 // ─────────────────────────────────────────────
 // SHOPEE
@@ -240,125 +247,176 @@ async function scrapeMLPage(url: string, cookies = ''): Promise<MLProduto[]> {
 // ROTAS
 // ─────────────────────────────────────────────
 
-// POST /api/v1/ofertas/sincronizar  (Shopee)
-router.post('/sincronizar', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
-  const creds = await getShopeeCredenciais(req.usuario!.id);
-  if (!creds) {
-    res.status(400).json({ sucesso: false, erro: { mensagem: 'Configure App ID e App Secret da Shopee na página Afiliado.' } });
-    return;
+export class ErroConfigSync extends Error {}
+
+export interface ResultadoSync {
+  plataforma: 'shopee' | 'mercadolivre';
+  totalNovos: number;
+  totalIgnorados: number;
+  totalUnicos?: number;
+  detalhes?: { fonte: string; encontrados: number }[];
+  erros: string[];
+}
+
+/** Sincroniza o catálogo da Shopee (usado pela rota e pelo job em fila). */
+export async function executarSyncShopee(usuarioId: string): Promise<ResultadoSync> {
+  // Para BUSCAR o catálogo pode usar a credencial padrão do servidor; o link de envio é sempre do usuário
+  const creds = await getShopeeCredenciais(usuarioId, { permitirPadrao: true });
+  if (!creds) throw new ErroConfigSync('Configure App ID e App Secret da Shopee na página Afiliado.');
+
+  const porItem  = new Map<string, { p: ProdutoShopee; categoria: string }>();
+  const detalhes: { fonte: string; encontrados: number }[] = [];
+  const erros: string[] = [];
+
+  for (const fonte of LISTAS_SHOPEE) {
+    try {
+      const produtos = await buscarPaginado(fonte.args, fonte.paginas, creds.appId, creds.appSecret);
+      for (const p of produtos) {
+        if (!p?.itemId) continue;
+        const key = String(p.itemId);
+        if (!porItem.has(key)) porItem.set(key, { p, categoria: fonte.nome });
+      }
+      detalhes.push({ fonte: fonte.nome, encontrados: produtos.length });
+    } catch (err) {
+      erros.push(`${fonte.nome}: ${(err as Error).message}`);
+    }
   }
 
-  try {
-    const porItem  = new Map<string, { p: ProdutoShopee; categoria: string }>();
-    const detalhes: { fonte: string; encontrados: number }[] = [];
-    const erros: string[] = [];
+  let totalNovos = 0, totalIgnorados = 0;
+  for (const { p, categoria } of porItem.values()) {
+    const preco = parseFloat(String(p.price));
+    const taxa  = parseFloat(String(p.commissionRate));
+    const com   = parseFloat(String(p.commission));
+    if (isNaN(preco) || preco < MIN_PRECO || isNaN(taxa) || taxa < MIN_COMISSAO) { totalIgnorados++; continue; }
 
-    // 1. Coleta de todas as fontes (com paginação) + dedupe por itemId
-    for (const fonte of LISTAS_SHOPEE) {
-      try {
-        const produtos = await buscarPaginado(fonte.args, fonte.paginas, creds.appId, creds.appSecret);
-        for (const p of produtos) {
-          if (!p?.itemId) continue;
-          const key = String(p.itemId);
-          if (!porItem.has(key)) porItem.set(key, { p, categoria: fonte.nome });
-        }
-        detalhes.push({ fonte: fonte.nome, encontrados: produtos.length });
-      } catch (err) {
-        erros.push(`${fonte.nome}: ${(err as Error).message}`);
+    const r = await pool.query(
+      `INSERT INTO ofertas
+         (item_id, nome, preco, imagem_url, link_produto, link_afiliado,
+          comissao, taxa_comissao, categoria_nome, plataforma, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'shopee','pendente')
+       ON CONFLICT (item_id) DO UPDATE SET
+         preco=EXCLUDED.preco, link_afiliado=EXCLUDED.link_afiliado,
+         taxa_comissao=EXCLUDED.taxa_comissao, atualizado_em=NOW()
+       RETURNING (xmax=0) AS inserido`,
+      [p.itemId, p.productName, preco, p.imageUrl, p.productLink,
+       p.offerLink, isNaN(com) ? null : com, taxa, categoria]
+    );
+    if (r.rows[0]?.inserido) totalNovos++; else totalIgnorados++;
+  }
+
+  return { plataforma: 'shopee', totalNovos, totalIgnorados, totalUnicos: porItem.size, detalhes, erros };
+}
+
+/** Sincroniza ofertas do Mercado Livre (scraping das URLs configuradas). */
+export async function executarSyncML(usuarioId: string): Promise<ResultadoSync> {
+  const creds = await getMLCredenciais(usuarioId);
+  if (!creds) throw new ErroConfigSync('Configure Tag e Cookies do Mercado Livre na página Afiliado.');
+  if (!creds.urls.length) {
+    throw new ErroConfigSync('Adicione ao menos uma URL do Mercado Livre nas configurações de Afiliado (campo "URLs para buscar").');
+  }
+
+  let totalNovos = 0, totalIgnorados = 0;
+  const erros: string[] = [];
+  let cookies = creds.cookies;
+
+  for (const url of creds.urls) {
+    try {
+      const produtos = await scrapeMLPage(url, cookies);
+
+      for (const p of produtos) {
+        const { precoFinal, precoOriginal, descontoPct } = parsePrecosML(p.precoRaw);
+        if (!precoFinal || precoFinal < MIN_PRECO) { totalIgnorados++; continue; }
+
+        // Gerar link de afiliado (fallback para link original se cookies expiraram)
+        const { shortUrl, cookiesAtualizados } = await gerarLinkAfiliadoML(p.linkCompra, creds.tag, cookies, { usuarioId, contexto: 'sincronizacao' });
+        if (cookiesAtualizados) cookies = cookiesAtualizados;
+        const linkAfiliado = shortUrl || p.linkCompra;
+
+        const r = await pool.query(
+          `INSERT INTO ofertas
+             (item_id, nome, preco, preco_original, desconto_pct,
+              imagem_url, link_produto, link_afiliado,
+              categoria_nome, plataforma, status)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'Mercado Livre','mercadolivre','pendente')
+           ON CONFLICT (item_id) DO UPDATE SET
+             preco=EXCLUDED.preco, preco_original=EXCLUDED.preco_original,
+             desconto_pct=EXCLUDED.desconto_pct,
+             link_afiliado=EXCLUDED.link_afiliado, atualizado_em=NOW()
+           RETURNING (xmax=0) AS inserido`,
+          [p.idProduto, p.nome, precoFinal, precoOriginal, descontoPct,
+           p.imagem, p.linkCompra, linkAfiliado]
+        );
+        if (r.rows[0]?.inserido) totalNovos++; else totalIgnorados++;
       }
+    } catch (err) {
+      logger.warn({ url, err: (err as Error).message }, 'Erro ao scrape ML');
+      erros.push(`${url}: ${(err as Error).message}`);
+    }
+  }
+
+  if (cookies !== creds.cookies) await persistirCookiesML(usuarioId, cookies);
+  return { plataforma: 'mercadolivre', totalNovos, totalIgnorados, erros };
+}
+
+/**
+ * Enfileira a sincronização (padrão) ou roda na hora com ?aguardar=true.
+ * Em fila, a requisição volta em seguida com um jobId; o status sai em GET /sincronizar/status/:jobId.
+ */
+async function responderSync(req: RequestComUsuario, res: Response, plataforma: 'shopee' | 'mercadolivre'): Promise<void> {
+  const usuarioId = req.usuario!.id;
+  const aguardar = req.query.aguardar === 'true' || (req.body as Record<string, unknown>)?.aguardar === true;
+
+  try {
+    if (!aguardar) {
+      // valida a configuração antes de enfileirar, para o erro aparecer na hora
+      if (plataforma === 'shopee' && !(await getShopeeCredenciais(usuarioId, { permitirPadrao: true }))) {
+        throw new ErroConfigSync('Configure App ID e App Secret da Shopee na página Afiliado.');
+      }
+      if (plataforma === 'mercadolivre') {
+        const c = await getMLCredenciais(usuarioId);
+        if (!c) throw new ErroConfigSync('Configure Tag e Cookies do Mercado Livre na página Afiliado.');
+        if (!c.urls.length) throw new ErroConfigSync('Adicione ao menos uma URL do Mercado Livre nas configurações de Afiliado (campo "URLs para buscar").');
+      }
+      const job = await filaOfertas.add('sincronizar-ofertas', { usuarioId, plataforma }, {
+        attempts: 1, removeOnComplete: 50, removeOnFail: 50,
+      });
+      res.status(202).json({ sucesso: true, emFila: true, jobId: String(job.id), plataforma });
+      return;
     }
 
-    // 2. Persistência das ofertas únicas
-    let totalNovos = 0, totalIgnorados = 0;
-    for (const { p, categoria } of porItem.values()) {
-      const preco = parseFloat(String(p.price));
-      const taxa  = parseFloat(String(p.commissionRate));
-      const com   = parseFloat(String(p.commission));
-      if (isNaN(preco) || preco < MIN_PRECO || isNaN(taxa) || taxa < MIN_COMISSAO) { totalIgnorados++; continue; }
-
-      const r = await pool.query(
-        `INSERT INTO ofertas
-           (item_id, nome, preco, imagem_url, link_produto, link_afiliado,
-            comissao, taxa_comissao, categoria_nome, plataforma, status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'shopee','pendente')
-         ON CONFLICT (item_id) DO UPDATE SET
-           preco=EXCLUDED.preco, link_afiliado=EXCLUDED.link_afiliado,
-           taxa_comissao=EXCLUDED.taxa_comissao, atualizado_em=NOW()
-         RETURNING (xmax=0) AS inserido`,
-        [p.itemId, p.productName, preco, p.imageUrl, p.productLink,
-         p.offerLink, isNaN(com) ? null : com, taxa, categoria]
-      );
-      if (r.rows[0]?.inserido) totalNovos++; else totalIgnorados++;
-    }
-
-    res.json({
-      sucesso: true, plataforma: 'shopee',
-      totalNovos, totalIgnorados, totalUnicos: porItem.size,
-      detalhes, erros,
-    });
+    const r = plataforma === 'shopee' ? await executarSyncShopee(usuarioId) : await executarSyncML(usuarioId);
+    res.json({ sucesso: true, ...r });
   } catch (erro) {
+    if (erro instanceof ErroConfigSync) {
+      res.status(400).json({ sucesso: false, erro: { mensagem: erro.message } });
+      return;
+    }
     res.status(500).json({ sucesso: false, erro: { mensagem: (erro as Error).message } });
   }
-});
+}
+
+// POST /api/v1/ofertas/sincronizar  (Shopee)
+router.post('/sincronizar', autenticacaoRequerida, (req: RequestComUsuario, res: Response) => responderSync(req, res, 'shopee'));
 
 // POST /api/v1/ofertas/sincronizar/mercadolivre
-router.post('/sincronizar/mercadolivre', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
-  const creds = await getMLCredenciais(req.usuario!.id);
-  if (!creds) {
-    res.status(400).json({
-      sucesso: false,
-      erro: { mensagem: 'Configure Tag e Cookies do Mercado Livre na página Afiliado.' },
-    });
-    return;
-  }
+router.post('/sincronizar/mercadolivre', autenticacaoRequerida, (req: RequestComUsuario, res: Response) => responderSync(req, res, 'mercadolivre'));
 
-  if (!creds.urls.length) {
-    res.status(400).json({
-      sucesso: false,
-      erro: { mensagem: 'Adicione ao menos uma URL do Mercado Livre nas configurações de Afiliado (campo "URLs para buscar").' },
-    });
-    return;
-  }
-
+// GET /api/v1/ofertas/sincronizar/status/:jobId
+router.get('/sincronizar/status/:jobId', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
   try {
-    let totalNovos = 0, totalIgnorados = 0;
-    const erros: string[] = [];
-
-    for (const url of creds.urls) {
-      try {
-        const produtos = await scrapeMLPage(url, creds.cookies);
-
-        for (const p of produtos) {
-          const { precoFinal, precoOriginal, descontoPct } = parsePrecosML(p.precoRaw);
-          if (!precoFinal || precoFinal < MIN_PRECO) { totalIgnorados++; continue; }
-
-          // Gerar link de afiliado (fallback para link original se cookies expiraram)
-          const { shortUrl } = await gerarLinkAfiliadoML(p.linkCompra, creds.tag, creds.cookies);
-          const linkAfiliado = shortUrl || p.linkCompra;
-
-          const r = await pool.query(
-            `INSERT INTO ofertas
-               (item_id, nome, preco, preco_original, desconto_pct,
-                imagem_url, link_produto, link_afiliado,
-                categoria_nome, plataforma, status)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'Mercado Livre','mercadolivre','pendente')
-             ON CONFLICT (item_id) DO UPDATE SET
-               preco=EXCLUDED.preco, preco_original=EXCLUDED.preco_original,
-               desconto_pct=EXCLUDED.desconto_pct,
-               link_afiliado=EXCLUDED.link_afiliado, atualizado_em=NOW()
-             RETURNING (xmax=0) AS inserido`,
-            [p.idProduto, p.nome, precoFinal, precoOriginal, descontoPct,
-             p.imagem, p.linkCompra, linkAfiliado]
-          );
-          if (r.rows[0]?.inserido) totalNovos++; else totalIgnorados++;
-        }
-      } catch (err) {
-        logger.warn({ url, err: (err as Error).message }, 'Erro ao scrape ML');
-        erros.push(`${url}: ${(err as Error).message}`);
-      }
+    const job = await filaOfertas.getJob(req.params.jobId);
+    if (!job || (job.data as { usuarioId?: string })?.usuarioId !== req.usuario!.id) {
+      res.status(404).json({ sucesso: false, erro: { mensagem: 'Sincronização não encontrada.' } });
+      return;
     }
-
-    res.json({ sucesso: true, plataforma: 'mercadolivre', totalNovos, totalIgnorados, erros });
+    const estado = await job.getState();
+    res.json({
+      sucesso: true,
+      jobId: String(job.id),
+      estado, // waiting | active | completed | failed | delayed
+      resultado: estado === 'completed' ? job.returnvalue : null,
+      erro: estado === 'failed' ? job.failedReason : null,
+    });
   } catch (erro) {
     res.status(500).json({ sucesso: false, erro: { mensagem: (erro as Error).message } });
   }
@@ -441,8 +499,8 @@ router.get('/categorias', autenticacaoRequerida, async (_req: Request, res: Resp
   }
 });
 
-// DELETE /api/v1/ofertas  — limpa ofertas (todas ou filtradas por plataforma/status)
-router.delete('/', autenticacaoRequerida, async (req: Request, res: Response): Promise<void> => {
+// DELETE /api/v1/ofertas  — limpa o catálogo global (somente administradores: afeta todos os usuários)
+router.delete('/', autenticacaoRequerida, exigirAdmin, async (req: Request, res: Response): Promise<void> => {
   const { plataforma, status } = req.query as Record<string, string>;
   const filtros: string[] = [];
   const params: unknown[] = [];
@@ -531,7 +589,7 @@ router.post('/:id/gerar-link-afiliado', autenticacaoRequerida, async (req: Reque
 });
 
 // POST /api/v1/ofertas/:id/enviar-whatsapp
-router.post('/:id/enviar-whatsapp', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
+router.post('/:id/enviar-whatsapp', autenticacaoRequerida, exigirPlanoAtivo, async (req: RequestComUsuario, res: Response): Promise<void> => {
   const { id } = req.params;
   const { legenda, grupos } = req.body as { legenda: string; grupos?: string[] };
   try {
@@ -543,7 +601,7 @@ router.post('/:id/enviar-whatsapp', autenticacaoRequerida, async (req: RequestCo
 });
 
 // POST /api/v1/ofertas/:id/enviar-telegram
-router.post('/:id/enviar-telegram', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
+router.post('/:id/enviar-telegram', autenticacaoRequerida, exigirPlanoAtivo, async (req: RequestComUsuario, res: Response): Promise<void> => {
   const { id } = req.params;
   const { legenda, chatIds } = req.body as { legenda: string; chatIds?: string[] };
   try {
