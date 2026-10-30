@@ -153,6 +153,22 @@ router.put(
   }
 );
 
+// GET /api/v1/landing/imagem — imagem atual (inclusive com a página despublicada), para o editor
+router.get('/imagem', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
+  try {
+    const r = await pool.query(
+      `SELECT imagem, imagem_mime FROM landing_pages WHERE usuario_id = $1 AND imagem IS NOT NULL`,
+      [req.usuario!.id]
+    );
+    if (!r.rows.length) { res.status(404).end(); return; }
+    res.setHeader('Content-Type', r.rows[0].imagem_mime || 'image/jpeg');
+    res.setHeader('Cache-Control', 'private, max-age=60');
+    res.send(r.rows[0].imagem as Buffer);
+  } catch {
+    res.status(500).end();
+  }
+});
+
 // DELETE /api/v1/landing/imagem
 router.delete('/imagem', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
   try {
