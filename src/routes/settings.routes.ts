@@ -1,6 +1,9 @@
 import { Router, Response } from 'express';
 import { body, validationResult } from 'express-validator';
-import { pool } from '../config/database';
+import {
+  lerSetting, salvarSetting, mascararPayload, eValorMascarado,
+  lerConfigRelay, normalizarConfigRelay,
+} from '../services/settings.service';
 import { autenticacaoRequerida, RequestComUsuario } from '../middleware/authRequired';
 import { logger } from '../utils/logger';
 
@@ -20,33 +23,14 @@ const PAYLOAD_TELEGRAM_VAZIO = {
   status:   'inactive',
 };
 
-function mascararCamposSensiveis(payload: Record<string, unknown>): Record<string, unknown> {
-  const mascarar = (val: string) => val ? '***' + val.slice(-4) : '';
-  const p = { ...payload } as Record<string, Record<string, string>>;
-
-  if (p.amazon?.cookies)        p.amazon       = { ...p.amazon,       cookies:     mascarar(p.amazon.cookies) };
-  if (p.mercadoLivre?.cookies)  p.mercadoLivre = { ...p.mercadoLivre, cookies:     mascarar(p.mercadoLivre.cookies) };
-  if (p.shopee?.appSecret)      p.shopee       = { ...p.shopee,       appSecret:   mascarar(p.shopee.appSecret) };
-  if (p.aliexpress?.apiSecret)  p.aliexpress   = { ...p.aliexpress,   apiSecret:   mascarar(p.aliexpress.apiSecret) };
-
-  return p;
-}
-
 // GET /api/v1/settings/affiliate
 router.get('/affiliate', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
   const usuarioId = req.usuario!.id;
   try {
-    const resultado = await pool.query(
-      `SELECT payload FROM user_settings WHERE usuario_id = $1 AND tipo = 'affiliate'`,
-      [usuarioId]
-    );
-    const payload = resultado.rows.length > 0
-      ? resultado.rows[0].payload as Record<string, unknown>
-      : PAYLOAD_AFILIADO_VAZIO;
-
+    const payload = (await lerSetting(usuarioId, 'affiliate')) || PAYLOAD_AFILIADO_VAZIO;
     res.json({
       sucesso: true,
-      setting: { tipo: 'affiliate', payload: mascararCamposSensiveis(payload) },
+      setting: { tipo: 'affiliate', payload: mascararPayload('affiliate', payload) },
     });
   } catch (erro) {
     logger.error({ erro }, 'Erro ao buscar settings afiliado');
@@ -55,18 +39,13 @@ router.get('/affiliate', autenticacaoRequerida, async (req: RequestComUsuario, r
 });
 
 // PUT /api/v1/settings/affiliate
+// Campos sensíveis enviados mascarados (***abcd) mantêm o valor já salvo.
 router.put('/affiliate', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
   const usuarioId = req.usuario!.id;
   const payload = req.body as Record<string, unknown>;
 
   try {
-    await pool.query(
-      `INSERT INTO user_settings (usuario_id, tipo, payload)
-       VALUES ($1, 'affiliate', $2)
-       ON CONFLICT (usuario_id, tipo)
-       DO UPDATE SET payload = $2, atualizado_em = NOW()`,
-      [usuarioId, JSON.stringify(payload)]
-    );
+    await salvarSetting(usuarioId, 'affiliate', payload);
     res.json({ sucesso: true, mensagem: 'Configurações de afiliado salvas com sucesso.' });
   } catch (erro) {
     logger.error({ erro }, 'Erro ao salvar settings afiliado');
@@ -78,19 +57,8 @@ router.put('/affiliate', autenticacaoRequerida, async (req: RequestComUsuario, r
 router.get('/telegram', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
   const usuarioId = req.usuario!.id;
   try {
-    const resultado = await pool.query(
-      `SELECT payload FROM user_settings WHERE usuario_id = $1 AND tipo = 'telegram'`,
-      [usuarioId]
-    );
-    const payload = resultado.rows.length > 0
-      ? resultado.rows[0].payload as Record<string, unknown>
-      : PAYLOAD_TELEGRAM_VAZIO;
-
-    // Mascarar botToken na resposta GET
-    const payloadMascarado = {
-      ...payload,
-      botToken: (payload.botToken as string) ? '***' + (payload.botToken as string).slice(-4) : '',
-    };
+    const payload = (await lerSetting(usuarioId, 'telegram')) || PAYLOAD_TELEGRAM_VAZIO;
+    const payloadMascarado = mascararPayload('telegram', payload);
 
     res.json({ sucesso: true, setting: { tipo: 'telegram', payload: payloadMascarado } });
   } catch (erro) {
@@ -118,14 +86,9 @@ router.put(
     const { botToken, chatIds, status } = req.body as { botToken: string; chatIds: string[]; status: string };
 
     try {
-      const payload = { botToken: botToken?.trim() || '', chatIds: chatIds || [], status };
-      await pool.query(
-        `INSERT INTO user_settings (usuario_id, tipo, payload)
-         VALUES ($1, 'telegram', $2)
-         ON CONFLICT (usuario_id, tipo)
-         DO UPDATE SET payload = $2, atualizado_em = NOW()`,
-        [usuarioId, JSON.stringify(payload)]
-      );
+      // botToken mascarado (***abcd) ou ausente mantém o token salvo
+      const payload = { botToken: typeof botToken === 'string' ? botToken.trim() : undefined, chatIds: chatIds || [], status };
+      await salvarSetting(usuarioId, 'telegram', payload);
       res.json({ sucesso: true, mensagem: 'Configuração do Telegram salva com sucesso.' });
     } catch (erro) {
       logger.error({ erro }, 'Erro ao salvar settings telegram');
@@ -149,9 +112,14 @@ router.post(
       return;
     }
 
-    const { botToken, chatIds } = req.body as { botToken: string; chatIds: string[] };
+    const { chatIds } = req.body as { botToken: string; chatIds: string[] };
+    let { botToken } = req.body as { botToken: string };
 
     try {
+      if (eValorMascarado(botToken)) {
+        const salvo = await lerSetting(req.usuario!.id, 'telegram');
+        botToken = String(salvo?.botToken || '');
+      }
       const resultados: { chatId: string; ok: boolean }[] = [];
 
       for (const chatId of chatIds) {
@@ -192,5 +160,28 @@ router.post(
     }
   }
 );
+
+// GET /api/v1/settings/relay — cabeçalho, rodapé e ritmo do relay
+router.get('/relay', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
+  try {
+    const config = await lerConfigRelay(req.usuario!.id);
+    res.json({ sucesso: true, setting: { tipo: 'relay', payload: config } });
+  } catch (erro) {
+    logger.error({ erro }, 'Erro ao buscar settings relay');
+    res.status(500).json({ sucesso: false, erro: { codigo: 'ERRO_INTERNO', mensagem: 'Erro interno', codigoStatus: 500 } });
+  }
+});
+
+// PUT /api/v1/settings/relay
+router.put('/relay', autenticacaoRequerida, async (req: RequestComUsuario, res: Response): Promise<void> => {
+  try {
+    const config = normalizarConfigRelay(req.body as Record<string, unknown>);
+    await salvarSetting(req.usuario!.id, 'relay', { ...config });
+    res.json({ sucesso: true, mensagem: 'Configurações do relay salvas com sucesso.', setting: { tipo: 'relay', payload: config } });
+  } catch (erro) {
+    logger.error({ erro }, 'Erro ao salvar settings relay');
+    res.status(500).json({ sucesso: false, erro: { codigo: 'ERRO_INTERNO', mensagem: 'Erro interno', codigoStatus: 500 } });
+  }
+});
 
 export default router;

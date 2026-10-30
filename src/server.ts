@@ -12,6 +12,9 @@ import agendamentoRoutes from './routes/agendamento.routes';
 import afiliadoRoutes from './routes/afiliado.routes';
 import n8nCompatRoutes from './routes/n8n-compat.routes';
 import ajudaRoutes from './routes/ajuda.routes';
+import landingRoutes from './routes/landing.routes';
+import publicRoutes from './routes/public.routes';
+import adminRoutes from './routes/admin.routes';
 import { errorHandler } from './middleware/errorHandler';
 
 export function criarApp(): express.Application {
@@ -22,6 +25,11 @@ export function criarApp(): express.Application {
     credentials: true,
   }));
 
+  // Proxy (Easypanel/nginx) na frente: necessário para o IP real nos rate limits
+  app.set('trust proxy', 1);
+
+  // Upload da imagem da landing chega em base64 (até 2 MB de imagem)
+  app.use('/api/v1/landing/imagem', express.json({ limit: '4mb' }));
   app.use(express.json());
   app.use(cookieParser());
 
@@ -43,6 +51,10 @@ export function criarApp(): express.Application {
   app.use('/api/n8n', n8nCompatRoutes);
   // Chat de suporte com IA (público — sem autenticação)
   app.use('/api/v1/ajuda', ajudaRoutes);
+  // Landing page do usuário: editor (autenticado) e página pública
+  app.use('/api/v1/landing', landingRoutes);
+  app.use('/api/v1/public', publicRoutes);
+  app.use('/api/v1/admin', adminRoutes);
 
   app.use(errorHandler);
 

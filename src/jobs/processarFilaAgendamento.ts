@@ -4,6 +4,7 @@
 import { pool } from '../config/database';
 import { logger } from '../utils/logger';
 import { enviarOfertaWhatsApp, enviarOfertaTelegram, ResultadoEnvio } from '../services/envio.service';
+import { podeEnviar } from '../services/plano.service';
 
 const INTERVALO_CHECK_MS = 60_000;
 let processando = false;
@@ -30,6 +31,12 @@ async function processarFila(): Promise<void> {
     for (const cfg of configs.rows as Array<{
       usuario_id: string; intervalo_min: number; grupos: string[]; enviar_telegram: boolean;
     }>) {
+      // Plano inativo (com bloqueio ligado): não envia e tenta de novo no próximo intervalo
+      if (!(await podeEnviar(cfg.usuario_id))) {
+        await avancarProximoEnvio(cfg.usuario_id, cfg.intervalo_min);
+        continue;
+      }
+
       // Próximo item pendente da fila
       const itemRes = await pool.query(
         `SELECT id, oferta_id, legenda FROM agendamento_itens
@@ -49,13 +56,13 @@ async function processarFila(): Promise<void> {
 
       try {
         waResult = await enviarOfertaWhatsApp(
-          cfg.usuario_id, item.oferta_id, item.legenda, grupos.length ? grupos : undefined
+          cfg.usuario_id, item.oferta_id, item.legenda, grupos.length ? grupos : undefined, 'agendado'
         );
       } catch (e) { waErroConfig = (e as Error).message; }
 
       if (cfg.enviar_telegram) {
         try {
-          tgResult = await enviarOfertaTelegram(cfg.usuario_id, item.oferta_id, item.legenda);
+          tgResult = await enviarOfertaTelegram(cfg.usuario_id, item.oferta_id, item.legenda, undefined, 'agendado');
         } catch (e) { tgErroConfig = (e as Error).message; }
       }
 

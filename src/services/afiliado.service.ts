@@ -4,14 +4,15 @@
 import crypto from 'crypto';
 import { pool } from '../config/database';
 import { logger } from '../utils/logger';
+import { lerSetting, salvarSetting } from './settings.service';
 
 // ─────────────────────────────────────────────
 // Log de criação de links (tabela affiliate_link_logs)
 // ─────────────────────────────────────────────
 
-export type ContextoLink = 'envio' | 'sincronizacao' | 'manual';
+export type ContextoLink = 'envio' | 'sincronizacao' | 'manual' | 'relay';
 
-async function logLink(opts: {
+export async function logLink(opts: {
   usuarioId: string | null;
   plataforma: string;
   contexto: ContextoLink;
@@ -47,29 +48,32 @@ async function logLink(opts: {
 // Credenciais (página Afiliado)
 // ─────────────────────────────────────────────
 
-export async function getShopeeCredenciais(usuarioId: string): Promise<{ appId: string; appSecret: string } | null> {
-  const r = await pool.query(
-    `SELECT payload FROM user_settings WHERE usuario_id = $1 AND tipo = 'affiliate'`,
-    [usuarioId]
-  );
-  const shopee = r.rows.length
-    ? (r.rows[0].payload as Record<string, Record<string, string>>)?.shopee
-    : null;
+/**
+ * Credenciais da Shopee do usuário.
+ * `permitirPadrao` usa SHOPEE_APP_ID/SHOPEE_SECRET do servidor quando o usuário não configurou —
+ * só para BUSCAR o catálogo. Nunca use o padrão para gerar link de envio: a comissão iria para outra conta.
+ */
+export async function getShopeeCredenciais(
+  usuarioId: string, opts: { permitirPadrao?: boolean } = {},
+): Promise<{ appId: string; appSecret: string } | null> {
+  const aff = await lerSetting(usuarioId, 'affiliate');
+  const shopee = (aff?.shopee || {}) as Record<string, string>;
 
-  const appId     = shopee?.appId     || process.env.SHOPEE_APP_ID || '';
-  const appSecret = shopee?.appSecret || process.env.SHOPEE_SECRET || '';
+  let appId     = shopee.appId     || '';
+  let appSecret = shopee.appSecret || '';
+  if ((!appId || !appSecret) && opts.permitirPadrao) {
+    appId     = process.env.SHOPEE_APP_ID || '';
+    appSecret = process.env.SHOPEE_SECRET || '';
+  }
 
   if (!appId || !appSecret) return null;
   return { appId, appSecret };
 }
 
 export async function getMLCredenciais(usuarioId: string): Promise<{ tag: string; cookies: string; urls: string[] } | null> {
-  const r = await pool.query(
-    `SELECT payload FROM user_settings WHERE usuario_id = $1 AND tipo = 'affiliate'`,
-    [usuarioId]
-  );
-  if (!r.rows.length) return null;
-  const ml = (r.rows[0].payload as Record<string, Record<string, string>>)?.mercadoLivre;
+  const aff = await lerSetting(usuarioId, 'affiliate');
+  if (!aff) return null;
+  const ml = (aff.mercadoLivre || {}) as Record<string, string>;
   if (!ml?.tag || !ml?.cookies) return null;
   const urls = (ml.urls || '')
     .split('\n')
@@ -254,17 +258,10 @@ export async function gerarLinkAfiliadoML(
 
 /** Persiste cookies ML renovados no user_settings. */
 export async function persistirCookiesML(usuarioId: string, cookies: string): Promise<void> {
-  const r = await pool.query(
-    `SELECT payload FROM user_settings WHERE usuario_id = $1 AND tipo = 'affiliate'`,
-    [usuarioId]
-  );
-  if (!r.rows.length) return;
-  const payload = r.rows[0].payload as Record<string, unknown>;
-  const ml = (payload.mercadoLivre || {}) as Record<string, string>;
-  await pool.query(
-    `UPDATE user_settings SET payload = $1, atualizado_em = NOW() WHERE usuario_id = $2 AND tipo = 'affiliate'`,
-    [JSON.stringify({ ...payload, mercadoLivre: { ...ml, cookies } }), usuarioId]
-  );
+  const aff = await lerSetting(usuarioId, 'affiliate');
+  if (!aff) return;
+  const ml = (aff.mercadoLivre || {}) as Record<string, string>;
+  await salvarSetting(usuarioId, 'affiliate', { ...aff, mercadoLivre: { ...ml, cookies } });
 }
 
 // ─────────────────────────────────────────────
@@ -286,7 +283,9 @@ export async function resolverLinkAfiliado(
   usuarioId: string, oferta: OfertaLink, contexto: ContextoLink = 'envio',
 ): Promise<string> {
   const origem   = oferta.link_produto || oferta.link_afiliado || '';
-  const fallback = oferta.link_afiliado || oferta.link_produto || '';
+  // Sem link do próprio usuário, cai para o link do produto (sem afiliado).
+  // Nunca usar oferta.link_afiliado: é o link de quem sincronizou o catálogo por último.
+  const fallback = oferta.link_produto || '';
   if (!origem) return fallback;
 
   if (oferta.plataforma === 'shopee') {
