@@ -100,7 +100,8 @@ export async function salvarConfigEmail(entrada: Record<string, unknown>, adminE
 }
 
 export function urlAppPadrao(): string {
-  return (process.env.APP_URL || process.env.PUBLIC_URL || process.env.FRONTEND_URL || '').replace(/\/$/, '');
+  // APP_URL é o endereço da API (usado pelo Mercado Pago), não serve para links do painel
+  return (process.env.PUBLIC_URL || process.env.FRONTEND_URL || '').split(',')[0].trim().replace(/\/$/, '');
 }
 
 export function criarTransporte(c: ConfigEmail): Transporter {
