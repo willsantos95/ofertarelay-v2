@@ -17,16 +17,31 @@ import publicRoutes from './routes/public.routes';
 import adminRoutes from './routes/admin.routes';
 import { errorHandler } from './middleware/errorHandler';
 
+/** Domínios que podem chamar a API pelo navegador: FRONTEND_URL, PUBLIC_URL (e www) e CORS_ORIGINS. */
+export function origensPermitidas(): string[] {
+  const lista = [process.env.FRONTEND_URL, process.env.PUBLIC_URL, process.env.CORS_ORIGINS]
+    .flatMap((v) => String(v || '').split(','))
+    .map((v) => v.trim().replace(/\/$/, ''))
+    .filter(Boolean);
+  const comWww = lista.flatMap((o) => {
+    const m = o.match(/^(https?:\/\/)(www\.)?(.+)$/);
+    return m ? [`${m[1]}${m[3]}`, `${m[1]}www.${m[3]}`] : [o];
+  });
+  const todas = [...new Set(comWww)];
+  return todas.length ? todas : ['http://localhost:3000'];
+}
+
 export function criarApp(): express.Application {
   const app = express();
 
   app.use(cors({
-    origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+    origin: origensPermitidas(),
     credentials: true,
   }));
 
-  // Proxy (Easypanel/nginx) na frente: necessário para o IP real nos rate limits
-  app.set('trust proxy', 1);
+  // Proxies na frente (Traefik do Easypanel e, pelo frontend, o nginx): confia nos IPs de rede
+  // interna para achar o IP real do visitante nos rate limits.
+  app.set('trust proxy', 'loopback, linklocal, uniquelocal');
 
   // Upload da imagem da landing chega em base64 (até 2 MB de imagem)
   app.use('/api/v1/landing/imagem', express.json({ limit: '4mb' }));

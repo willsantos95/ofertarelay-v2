@@ -4,6 +4,7 @@ import rateLimit from 'express-rate-limit';
 
 import { Router, Request, Response } from 'express';
 import { chatConfigurado, responderChat, MensagemHistorico } from '../services/ajuda.service';
+import { logger } from '../utils/logger';
 
 const router = Router();
 
@@ -85,6 +86,7 @@ router.post('/chat', limitadorChat, async (req: Request, res: Response) => {
     res.json({ sucesso: true, resposta });
   } catch (err) {
     const msg = (err as Error).message || 'Erro desconhecido';
+    logger.error({ err: msg }, 'Falha no chat de ajuda');
     res.status(500).json({
       sucesso: false,
       erro: { mensagem: `Falha ao processar mensagem: ${msg}` },

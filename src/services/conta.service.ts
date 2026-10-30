@@ -10,7 +10,7 @@ export function hashToken(t: string): string {
   return crypto.createHash('sha256').update(t).digest('hex');
 }
 
-/** Endereço do painel para montar links: config do admin > APP_URL > origem do pedido. */
+/** Endereço do painel para montar links: config do admin > PUBLIC_URL/FRONTEND_URL > origem do pedido. */
 export async function urlApp(req: Request): Promise<string> {
   const c = await lerConfigEmail().catch(() => null);
   if (c?.urlApp) return c.urlApp;
