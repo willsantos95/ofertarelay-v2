@@ -23,16 +23,23 @@ const ICONES: Record<TipoBotao, string> = {
   link: '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M10.6 13.4a1 1 0 0 0 1.4 0l4-4a3 3 0 0 0-4.2-4.2l-1.5 1.5 1.4 1.4 1.5-1.5a1 1 0 0 1 1.4 1.4l-4 4a1 1 0 0 0 0 1.4Zm2.8-2.8a1 1 0 0 0-1.4 0l-4 4a3 3 0 0 0 4.2 4.2l1.5-1.5-1.4-1.4-1.5 1.5a1 1 0 0 1-1.4-1.4l4-4a1 1 0 0 0 0-1.4Z"/></svg>',
 };
 
-export function renderizarLanding(l: Landing, opts: { baseApi: string; urlPagina: string }): string {
+/**
+ * baseApi: caminho da API usado DENTRO da página (relativo, ex. "/api/v1"), para funcionar em
+ *   qualquer domínio que sirva a página — inclusive quando um domínio a exibe por encaminhamento
+ *   com máscara (iframe), como o encaminhamento de domínio da Hostinger.
+ * origem: endereço absoluto do site, só para as tags de prévia (og:image, og:url).
+ */
+export function renderizarLanding(l: Landing, opts: { baseApi: string; urlPagina: string; origem?: string }): string {
   const cor = l.cor;
   const fg = corTexto(cor);
   const versao = l.imagem_atualizada_em ? new Date(l.imagem_atualizada_em).getTime() : 0;
   const imagem = l.tem_imagem ? `${opts.baseApi}/public/landing/${encodeURIComponent(l.slug)}/imagem?v=${versao}` : '';
+  const imagemAbsoluta = imagem && /^https?:/.test(imagem) ? imagem : (imagem && opts.origem ? `${opts.origem}${imagem}` : imagem);
   const titulo = l.titulo || l.slug;
   const descricao = l.descricao || 'Entre no grupo e receba as melhores ofertas.';
 
   const botoes = l.botoes.map((b) => `
-      <a class="btn" href="${esc(`${opts.baseApi}/public/l/${encodeURIComponent(l.slug)}/${b.id}`)}" rel="noopener">
+      <a class="btn" href="${esc(`${opts.baseApi}/public/l/${encodeURIComponent(l.slug)}/${b.id}`)}" target="_top" rel="noopener">
         <span class="ico">${ICONES[b.tipo] || ICONES.link}</span>
         <span class="txt">${esc(b.rotulo)}</span>
       </a>`).join('');
@@ -48,7 +55,7 @@ export function renderizarLanding(l: Landing, opts: { baseApi: string; urlPagina
 <meta property="og:title" content="${esc(titulo)}">
 <meta property="og:description" content="${esc(descricao)}">
 <meta property="og:url" content="${esc(opts.urlPagina)}">
-${imagem ? `<meta property="og:image" content="${esc(imagem)}">` : ''}
+${imagemAbsoluta ? `<meta property="og:image" content="${esc(imagemAbsoluta)}">` : ''}
 <meta name="theme-color" content="${esc(cor)}">
 ${imagem ? `<link rel="icon" href="${esc(imagem)}">` : ''}
 <style>
@@ -86,7 +93,7 @@ ${imagem ? `<link rel="icon" href="${esc(imagem)}">` : ''}
   <nav class="btns">${botoes || '<div class="vazio">Nenhum link disponível no momento.</div>'}
   </nav>
   <p class="gratis">É grátis, e você pode sair quando quiser.</p>
-  <footer>Feito com <a href="/" rel="noopener">OfertaRelay</a></footer>
+  <footer>Feito com <a href="/" target="_top" rel="noopener">OfertaRelay</a></footer>
 </main>
 </body>
 </html>`;

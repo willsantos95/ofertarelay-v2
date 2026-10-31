@@ -16,9 +16,10 @@ router.use(rateLimit({
   skip: () => process.env.NODE_ENV === 'test',
 }));
 
-/** Endereço público (para og:image/og:url): PUBLIC_URL ou o host que chegou pelo proxy. */
+/** Endereço do site que serviu a página (para og:image/og:url); PUBLIC_URL só se faltar o host. */
 function origemPublica(req: Request): string {
-  if (process.env.PUBLIC_URL) return process.env.PUBLIC_URL.replace(/\/$/, '');
+  const hostProxy = String(req.headers['x-forwarded-host'] || '').split(',')[0].trim();
+  if (!hostProxy && process.env.PUBLIC_URL) return process.env.PUBLIC_URL.replace(/\/$/, '');
   const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0];
   const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0];
   return `${proto}://${host}`;
@@ -37,8 +38,9 @@ router.get('/p/:slug', async (req: Request, res: Response): Promise<void> => {
 
     const origem = origemPublica(req);
     res.send(renderizarLanding(landing, {
-      baseApi: `${origem}/api/v1`,
+      baseApi: '/api/v1',
       urlPagina: `${origem}/${landing.slug}`,
+      origem,
     }));
   } catch (e) {
     logger.error({ e, slug }, 'Erro ao renderizar landing');

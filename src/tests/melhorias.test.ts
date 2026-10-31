@@ -161,6 +161,7 @@ describe('Funções auxiliares', () => {
     }, { baseApi: 'https://x.com/api/v1', urlPagina: 'https://x.com/capivara' });
     expect(html).not.toContain('<script>x</script>');
     expect(html).toContain('/public/l/capivara/b1');
+    expect(html).toContain('target="_top"');
   });
 });
 
